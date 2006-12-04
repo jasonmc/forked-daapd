@@ -131,6 +131,7 @@ static int scan_static_playlist(char *path);
 static TAGHANDLER taghandlers[] = {
     { "aac", scan_get_aacinfo, "m4a", "mp4a", "AAC audio file" },
     { "mp4", scan_get_aacinfo, "m4a", "mp4a", "AAC audio file" },
+    { "m4b", scan_get_aacinfo, "m4a", "mp4a", "Protected AAC audio file" },
     { "m4a", scan_get_aacinfo, "m4a", "mp4a", "AAC audio file" },
     { "m4p", scan_get_aacinfo, "m4p", "mp4a", "AAC audio file" },
     { "mp3", scan_get_mp3info, "mp3", "mpeg", "MPEG audio file" },
@@ -366,7 +367,7 @@ int scan_path(char *path) {
         realpath(relative_path,mp3_path);
         DPRINTF(E_DBG,L_SCAN,"Found %s\n",relative_path);
         if(os_stat(mp3_path,&sb)) {
-            DPRINTF(E_WARN,L_SCAN,"Error statting: %s\n",strerror(errno));
+            DPRINTF(E_INF,L_SCAN,"Error statting %s: %s\n",mp3_path,strerror(errno));
         } else {
             if(sb.st_mode & S_IFDIR) { /* dir -- recurse */
                 if(conf_get_int("scanning","ignore_appledouble",1) && 
@@ -413,7 +414,7 @@ int scan_static_playlist(char *path) {
 
     DPRINTF(E_WARN,L_SCAN|L_PL,"Processing static playlist: %s\n",path);
     if(os_stat(path,&sb)) {
-        DPRINTF(E_WARN,L_SCAN,"Error statting %s: %s\n",path,strerror(errno));
+        DPRINTF(E_INF,L_SCAN,"Error statting %s: %s\n",path,strerror(errno));
         return FALSE;
     }
 
@@ -569,7 +570,7 @@ void scan_filename(char *path, int compdir, char *extensions) {
 
 
     if(os_stat(mp3_path,&sb)) {
-        DPRINTF(E_WARN,L_SCAN,"Error statting: %s\n",strerror(errno));
+        DPRINTF(E_INF,L_SCAN,"Error statting: %s\n",strerror(errno));
     } else {
         /* we assume this is regular file */
         if(strlen(fname) > 2) {
@@ -619,7 +620,8 @@ void scan_music_file(char *path, char *fname,
     memset((void*)&mp3file,0,sizeof(mp3file));
     mp3file.path=strdup(path);
     mp3file.fname=strdup(fname);
-    
+    mp3file.file_size = psb->st_size;
+
     if((fname) && (strlen(fname) > 1) && (fname[strlen(fname)-1] != '.')) {
         type = strrchr(fname, '.') + 1;
         if(type && *type) {
@@ -729,9 +731,6 @@ int scan_freetags(MP3FILE *pmp3) {
  * @param pmp3 struct to stuff with info gleaned
  */
 int scan_get_info(char *file, MP3FILE *pmp3) {
-    FILE *infile;
-    off_t file_size;
-
     TAGHANDLER *hdl;
 
     /* dispatch to appropriate tag handler */
@@ -739,20 +738,6 @@ int scan_get_info(char *file, MP3FILE *pmp3) {
     if(hdl && hdl->scanner)
         return hdl->scanner(file,pmp3);
 
-    /* a file we don't know anything about... ogg or aiff maybe */
-    if(!(infile=fopen(file,"rb"))) {
-        DPRINTF(E_WARN,L_SCAN,"Could not open %s for reading\n",file);
-        return FALSE;
-    }
-
-    /* we can at least get this */
-    fseek(infile,0,SEEK_END);
-    file_size=ftell(infile);
-    fseek(infile,0,SEEK_SET);
-
-    pmp3->file_size=file_size;
-
-    fclose(infile);
     return TRUE;
 }
 
@@ -807,13 +792,18 @@ void make_composite_tags(MP3FILE *song) {
         }
     }
 
+    /* verify we have tags for the big 4 */
+    if(conf_get_int("daap","empty_strings",0)) {
+        if(!song->artist) song->artist = strdup("Unknown");
+        if(!song->album) song->album = strdup("Unknown");
+        if(!song->genre) song->genre = strdup("Unknown");
+    }
+    if(!song->title) song->title = strdup(song->fname);
+
     if(song->url)
         song->data_kind=1;
     else
         song->data_kind=0;
-
-    if(!song->title)
-        song->title = strdup(song->fname);
 
     song->item_kind = 2; /* music, I think. */
 }
