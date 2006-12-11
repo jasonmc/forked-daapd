@@ -53,34 +53,10 @@
 ; Uninstaller pages
 !insertmacro MUI_UNPAGE_INSTFILES
 
+; Language files
+!insertmacro MUI_LANGUAGE "English"
+
 ; MUI end ------
-!macro LANG_LOAD LANGLOAD
-  !insertmacro MUI_LANGUAGE "${LANGLOAD}"
-;  !verbose 
-  !include "localizations\${LANGLOAD}.nsh"
-;  !verbose on
-  !undef LANG
-!macroend
-
-!macro LANG_STRING NAME VALUE
-  LangString "${NAME}" "${LANG_${LANG}}" "${VALUE}"
-!macroend
-
-!macro LANG_UNSTRING NAME VALUE
-  !insertmacro LANG_STRING "un.${NAME}" "${VALUE}"
-!macroend
-
-!macro LANG_BOTHSTRING NAME VALUE
-  !insertmacro LANG_STRING "${NAME}" "${VALUE}"
-  !insertmacro LANG_UNSTRING "${NAME}" "${VALUE}"
-!macroend
-
-
-;!insertmacro MUI_LANGUAGE "English"
-!insertmacro LANG_LOAD "English"
-!insertmacro LANG_LOAD "French"
-!insertmacro LANG_LOAD "Dutch"
-!insertmacro LANG_LOAD "German"
 
 Name "${PRODUCT_NAME}"
 Icon "..\ff.ico"
@@ -101,7 +77,7 @@ Section -Pre
   Pop $1
 
   StrCmp $0 "success" lbl_got_bonjour
-  MessageBox MB_OK "$(STRING_BONJOUR_ERROR)"
+  MessageBox MB_OK "Bonjour for Windows service not found.  Please install Apple's Bonjour for Windows."
   Quit
 
   lbl_got_bonjour:
@@ -116,16 +92,16 @@ Section -Pre
   goto lbl_continue
   
   lbl_stop_service:
-  DetailPrint "$(STRING_STOPPING_SERVICE)"
-  nsSCM::Stop "$(PRODUCT_NAME)"
+  DetailPrint "Stopping Service..."
+  nsSCM::Stop "${PRODUCT_NAME}"
 
   lbl_wait_stop:
   Sleep 1000
-  nsSCM::QueryStatus "$(PRODUCT_NAME)"
+  nsSCM::QueryStatus "${PRODUCT_NAME}"
   Pop $0
   Pop $1
 
-;  DetailPrint $0
+  DetailPrint $0
   StrCmp $0 "success" lbl_check_status
   goto lbl_continue
   
@@ -134,7 +110,7 @@ Section -Pre
 
   lbl_continue:
   ; should really loop until service stops...
-  DetailPrint "$(STRING_WAITING_FOR_STOP)"
+  DetailPrint "Waiting for service stop ($9)"
    
   IntOp $9 $9 + 1
   IntCmp $9 10 +1 +1 lbl_done_pre
@@ -152,9 +128,6 @@ Section "MainSection" SEC01
   SetOverwrite on
   File /oname=firefly.exe "${MTD_SOURCE}\mt-daapd.exe"
   File "${CONFIG_SOURCE}\FireflyShell.exe" 
-  File "${CONFIG_SOURCE}\FireflyShell-0c.dll"
-  File "${CONFIG_SOURCE}\FireflyShell-07.dll"
-  File "${CONFIG_SOURCE}\FireflyShell-13.dll"
   File "${CONFIG_SOURCE}\..\FireflyShell.exe.manifest"
   File "${DLL_SOURCE}\gnu_regex.dll"
   File "${DLL_SOURCE}\pthreadVC2.dll"
@@ -269,11 +242,11 @@ SectionEnd
 Section -AdditionalIcons
   WriteIniStr "$2\${PRODUCT_NAME}.url" "InternetShortcut" "URL" "${PRODUCT_WEB_SITE}"
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\$(STRING_WEBSITE).lnk" "$2\${PRODUCT_NAME}.url"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\$(STRING_UNINSTALL).lnk" "$2\uninst.exe"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\$(STRING_DEBUG_MODE).lnk" "$2\firefly.exe" "-d9 -f"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\$(STRING_FF_CONFIGURATION).lnk" "$2\FireflyShell.exe"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\$(STRING_ADV_CONFIG).lnk" "notepad.exe" "$2\mt-daapd.conf"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Website.lnk" "$2\${PRODUCT_NAME}.url"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk" "$2\uninst.exe"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Debug Mode.lnk" "$2\firefly.exe" "-d9 -f"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Firefly Configuration.lnk" "$2\FireflyShell.exe"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Advanced Configuration.lnk" "notepad.exe" "$2\mt-daapd.conf"
 
   Delete "$SMPROGRAMS\Startup\Firefly Configuration.lnk"
   
@@ -310,11 +283,11 @@ SectionEnd
 
 Function un.onUninstSuccess
   HideWindow
-  MessageBox MB_ICONINFORMATION|MB_OK "$(un.STRING_UNINSTALLED)"
+  MessageBox MB_ICONINFORMATION|MB_OK "$(^Name) was successfully removed from your computer."
 FunctionEnd
 
 Function un.onInit
-  MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 "$(un.STRING_AREYOUSURE)" IDYES +2
+  MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 "Are you sure you want to completely remove $(^Name) and all of its components?" IDYES +2
   Abort
 FunctionEnd
 
@@ -324,22 +297,6 @@ Function .onInit
   StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCT_NAME}"
   StrCpy $2 "$PROGRAMFILES\${PRODUCT_NAME}"
   StrCpy $3 "$DOCUMENTS\My Music"
-  
-;  Push ""
-;  Push ${LANG_ENGLISH}
-;  Push English
-;  Push ${LANG_FRENCH}
-;  Push French
-;  Push ${LANG_DUTCH}
-;  Push Dutch
-;  Push ${LANG_GERMAN}
-;  Push German
-;  ; more
-;  Push A
-;  LangDLL::LangDialog "Installer Language" "Please select the language of the installer"
-;  Pop $LANGUAGE
-;  StrCmp $LANGUAGE "cancel" 0 +2
-;  Abort
 FunctionEnd
 
 Function LicensePost
@@ -361,17 +318,17 @@ Function DirectoryShow
 
 AppDirectoryPage:
   StrCpy $9 "1"
-  !insertmacro MUI_INNERDIALOG_TEXT 1041 "$(STRING_DESTFOLDER)"
+  !insertmacro MUI_INNERDIALOG_TEXT 1041 "Destination Folder"
   !insertmacro MUI_INNERDIALOG_TEXT 1019 "$PROGRAMFILES\${PRODUCT_NAME}\"
-  !insertmacro MUI_INNERDIALOG_TEXT 1006 "$(STRING_DESTDETAIL)"
+  !insertmacro MUI_INNERDIALOG_TEXT 1006 "Setup will install ${PRODUCT_NAME} in the following folder.$\r$\n$\r$\nTo install in a different folder, click Browse and select another folder. Click Next to continue."
   Goto EndDirectoryShow
 
 MusicDirectoryPage:
   StrCpy $9 "2"
-  !insertmacro MUI_HEADER_TEXT "$(STRING_MUSICTITLE)" "$(STRING_MUSICHEADER)"
-  !insertmacro MUI_INNERDIALOG_TEXT 1041 "$(STRING_MUSICFOLDER)"
+  !insertmacro MUI_HEADER_TEXT "Choose Music Location" "Choose the folder containing music to share."
+  !insertmacro MUI_INNERDIALOG_TEXT 1041 "Music Folder"
   !insertmacro MUI_INNERDIALOG_TEXT 1019 "$DOCUMENTS\My Music"
-  !insertmacro MUI_INNERDIALOG_TEXT 1006 "$(STRING_MUSICDETAIL)"
+  !insertmacro MUI_INNERDIALOG_TEXT 1006 "Setup will share the music in the following folder.$\r$\n$\r$\nTo share a different folder, click Browse and select another folder. Click Install to start the installation."
 EndDirectoryShow:
 FunctionEnd
 
@@ -574,9 +531,6 @@ Section Uninstall
   Delete "$INSTDIR\firefly.exe"
   Delete "$INSTDIR\FireflyShell.exe"
   Delete "$INSTDIR\FireflyShell.exe.manifest"
-  Delete "$INSTDIR\FireflyShell-0c.dll"
-  Delete "$INSTDIR\FireflyShell-07.dll"
-  Delete "$INSTDIR\FireflyShell-13.dll"
   
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\Website.lnk"
