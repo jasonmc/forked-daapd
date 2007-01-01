@@ -61,6 +61,8 @@
 # define HOST_NAME_MAX 255
 #endif
 
+#define MAX_REND_LEN 62
+
 /** Globals */
 //static int ecode;
 static LL_HANDLE conf_main=NULL;
@@ -1635,19 +1637,86 @@ char *conf_get_filename(void) {
  */
 char *conf_get_servername(void) {
     char *retval;
-    char newname[HOST_NAME_MAX + 1 + 16]; /* " Firefly Server" */
+    char *default_name = "firefly %v on %h";
+    char hostname[HOST_NAME_MAX + 1]; /* " Firefly Server" */
+    char *template, *src, *dst;
+    int len;
 
-    gethostname(newname,HOST_NAME_MAX);
-    retval = strchr(newname,'.');
+    gethostname(hostname,HOST_NAME_MAX);
+    retval = strchr(hostname,'.');
     if(retval) *retval = '\0';
 
-    retval = newname;
+    retval = hostname;
     while(*retval) {
         *retval = tolower(*retval);
         retval++;
     }
 
-    strcat(newname," Firefly Server");
+    template = conf_alloc_string("general","servername",default_name);
+    src = template;
+    len = 0;
+    while(*src) {
+        if(*src == '%') {
+            src++;
+            switch(*src) {
+            case 'h':
+                len += strlen(hostname);
+                src++;
+                break;
+            case 'v':
+                len += strlen(VERSION);
+                src++;
+                break;
+            default:
+                len += 2;
+                src++;
+                break;
+            }
+        } else {
+            len++;
+            src++;
+        }
+    }
 
-    return conf_alloc_string("general","servername",newname);
+    retval = (char*)malloc(len+1);
+    if(!retval) DPRINTF(E_FATAL,L_MISC,"malloc");
+
+    memset(retval,0,len+1);
+
+    dst = retval;
+    src = template;
+
+    while(*src) {
+        if(*src == '%') {
+            src++;
+            switch(*src) {
+            case 'h':
+                strcat(dst,hostname);
+                dst += strlen(hostname);
+                src ++;
+                break;
+            case 'v':
+                strcat(dst,VERSION);
+                dst += strlen(VERSION);
+                src++;
+                break;
+            default:
+                *dst++ = '%';
+                *dst++ = *src++;
+                break;
+            }
+        } else {
+            *dst++ = *src++;
+        }
+                
+    }
+
+    if(strlen(retval) > MAX_REND_LEN) {
+        retval[MAX_REND_LEN] = '\0';
+        retval[MAX_REND_LEN-1] = '.';
+        retval[MAX_REND_LEN-2] = '.';
+        retval[MAX_REND_LEN-3] = '.';
+    }
+
+    return retval;
 }
