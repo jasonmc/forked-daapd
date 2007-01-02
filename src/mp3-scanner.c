@@ -76,7 +76,7 @@ typedef struct {
 static int scan_path(char *path);
 static int scan_get_info(char *file, MP3FILE *pmp3);
 static int scan_freetags(MP3FILE *pmp3);
-static void scan_music_file(char *path, char *fname,struct stat *psb, int is_compdir); 
+static void scan_music_file(char *path, char *fname,struct stat *psb, int is_compdir);
 
 static TAGHANDLER *scan_gethandler(char *type);
 
@@ -220,7 +220,7 @@ void scan_process_playlistlist(void) {
             if(strrchr(pnext->path,PATHSEP)) {
                 file = strrchr(pnext->path,PATHSEP) + 1;
             }
-            
+
             if(strcasecmp(file,"iTunes Music Library.xml") == 0) {
                 if(conf_get_int("scanning","process_xml",1)) {
                     DPRINTF(E_INF,L_SCAN,"Scanning %s\n",pnext->path);
@@ -255,7 +255,7 @@ void scan_process_playlistlist(void) {
 int scan_init(char **patharray) {
     int err=0;
     int index=0;
-    char resolved_path[MAX_PATH];
+    char resolved_path[PATH_MAX];
 
     DPRINTF(E_DBG,L_SCAN,"Starting scan_init\n");
 
@@ -372,7 +372,7 @@ int scan_path(char *path) {
             DPRINTF(E_INF,L_SCAN,"Error statting %s: %s\n",mp3_path,strerror(errno));
         } else {
             if(sb.st_mode & S_IFDIR) { /* dir -- recurse */
-                if(conf_get_int("scanning","ignore_appledouble",1) && 
+                if(conf_get_int("scanning","ignore_appledouble",1) &&
                    ((strcasecmp(pde->d_name,".AppleDouble") == 0) ||
                     (strcasecmp(pde->d_name,".AppleDesktop") == 0))) {
                     DPRINTF(E_DBG,L_SCAN,"Skipping appledouble folder\n");
@@ -461,11 +461,11 @@ int scan_static_playlist(char *path) {
         strcpy(base_path,path);
         ptr = base_path;
         while(*ptr) {
-            if((*ptr == '/') || (*ptr == '\\')) 
+            if((*ptr == '/') || (*ptr == '\\'))
                 *ptr = PATHSEP;
             ptr++;
         }
-        
+
         if((current=strrchr(base_path,PATHSEP))){
             *(current+1) = '\x0';
         } /* else something is fubar */
@@ -485,7 +485,7 @@ int scan_static_playlist(char *path) {
 
             ptr = linebuffer;
             while(*ptr) {
-                if((*ptr == '/') || (*ptr == '\\')) 
+                if((*ptr == '/') || (*ptr == '\\'))
                     *ptr = PATHSEP;
                 ptr++;
             }
@@ -524,7 +524,7 @@ int scan_static_playlist(char *path) {
 
 /**
  * here, we want to scan a file and add it (if necessary)
- * to the database.  
+ * to the database.
  *
  * @param path path of file to scan
  * @param compdir whether or not this is a compdir:
