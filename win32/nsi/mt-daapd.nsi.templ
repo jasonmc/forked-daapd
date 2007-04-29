@@ -190,7 +190,8 @@ NoProgramItems:
   File "${MTD_SOURCE}\w32-event.dll"
   File "${MTD_SOURCE}\ssc-ffmpeg.dll"
   File "${MTD_SOURCE}\ssc-wma.dll"
-  
+  Delete "$2\plugins\out-daap.dll"
+
   SetOutPath "$2\admin-root"
   File "${ADMIN_ROOT}\thanks.html"
   File "${ADMIN_ROOT}\about.html"
