@@ -418,7 +418,7 @@ int main(int argc, char *argv[]) {
 
     /* Initialize the database before starting */
     DPRINTF(E_LOG,L_MAIN|L_DB,"Initializing database\n");
-    if(db_init(&reload)) {
+    if(db_init(reload)) {
         DPRINTF(E_FATAL,L_MAIN|L_DB,"Error in db_init: %s\n",strerror(errno));
     }
 
