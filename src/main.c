@@ -363,7 +363,7 @@ int main(int argc, char *argv[]) {
         if(conf_get_array("plugins","plugins",&pluginarray)==TRUE) {
             index = 0;
             while(pluginarray[index]) {
-                sprintf(plugin,"%s/%s",plugindir,pluginarray[index]);
+                sprintf(plugin,"%s%c%s",plugindir,PATHSEP,pluginarray[index]);
                 if(plugin_load(&perr,plugin) != PLUGIN_E_SUCCESS) {
                     DPRINTF(E_LOG,L_MAIN,"Error loading plugin %s: %s\n",
                             plugin, perr);

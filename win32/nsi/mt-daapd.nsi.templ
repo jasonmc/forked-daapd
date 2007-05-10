@@ -256,13 +256,19 @@ HasLog:
 
 HasConf:
   WriteINIStr "$2\mt-daapd.conf" "plugins" "plugin_dir" "plugins"
-  WriteINIStr "$2\mt-daapd.conf" "plugins" "plugins" ""
   ReadINIStr $0 "$2\mt-daapd.conf" "general" "rescan_interval"
   StrCmp $0 "" rescan_set rescan_skip
  rescan_set:
   WriteINIStr "$2\mt-daapd.conf" "general" "rescan_interval" "600" 
  rescan_skip:
 
+  ReadINIStr $0 "$2\mt-daapd.conf" "plugins" "plugins"
+  StrCmp $0 "rsp.dll,w32-event.dll" plugin_set plugin_skip
+
+ plugin_set:
+   WriteINIStr "$2\mt-daapd.conf" "plugins" "plugins" "rsp.dll,w32-event.dll,ssc-ffmpeg.dll,ssc-wma.dll"
+ plugin_skip:
+ 
   ReadINIStr $0 "$2\mt-daapd.conf" "general" "logfile"
   StrCmp $0 "" logfile_set logfile_skip
   
