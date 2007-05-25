@@ -375,6 +375,7 @@ Function .onInit
   StrCpy $INSTDIR "$PROGRAMFILES\${PRODUCT_NAME}"
   StrCpy $2 "$PROGRAMFILES\${PRODUCT_NAME}"
   StrCpy $3 "$DOCUMENTS\My Music"
+  IfSilent lbl_skip_lang
   
   Push ""
   Push ${LANG_ENGLISH}
@@ -397,6 +398,9 @@ Function .onInit
   Pop $LANGUAGE
   StrCmp $LANGUAGE "cancel" 0 +2
   Abort
+  
+  lbl_skip_lang:
+  
 FunctionEnd
 
 Function LicensePost
