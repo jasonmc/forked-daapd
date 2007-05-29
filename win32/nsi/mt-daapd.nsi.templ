@@ -24,6 +24,10 @@ RequestExecutionLevel admin
 !define ADMIN_ROOT "${MTDROOT}\admin-root"
 !define REDIST_SOURCE "${PROJROOT}\win32\redist"
 
+!include "FileFunc.nsh"
+!insertmacro GetParameters
+!insertmacro GetOptionsS
+
 ; MUI 1.67 compatible ------
 !include "MUI.nsh"
 
@@ -338,8 +342,14 @@ Section -Post
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
   WriteRegStr ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
   
-  WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Run" "FireflyShell" '"$2\FireflyShell.exe" -q'
   DeleteRegValue HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Run" "FireflyShell" 
+
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptionsS} $R0 "/N" $R1
+  
+  IfErrors 0 +2                    ; Skip the write if we have the /N option
+  WriteRegStr HKCU "SOFTWARE\Microsoft\Windows\CurrentVersion\Run" "FireflyShell" '"$2\FireflyShell.exe" -q'
 
 ;  ExecWait "$2\mt-daapd.exe -i"
 
@@ -352,9 +362,23 @@ Section -Post
   MessageBox MB_OK "Error installing service: $1"
 
   lbl_install_success:
-  ExecWait 'netsh firewall add allowedprogram "$2\firefly.exe" "${PRODUCT_NAME}" enable'  
-
+;  ExecWait 'netsh firewall add allowedprogram "$2\firefly.exe" "${PRODUCT_NAME}" enable'  
+; Use the SimpleFC plugin
+ 
+  SimpleFC::IsFirewallServiceRunning
+  Pop $0
+  Pop $1
+  
+  intcmp $1 0 lbl_no_fw     ; if 0, then skip fw config
+  SimpleFC::AddApplication "Firefly Media Server" "$2\Firefly.exe" 0 2 "" 1
+  
+ lbl_no_fw:
   nsSCM::Start "${PRODUCT_NAME}"
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptionsS} $R0 "/N" $R1
+  
+  IfErrors 0 +2                    ; Skip the run if we have the /N option
   Exec '"$2\FireflyShell.exe" -q'
 SectionEnd
 
@@ -512,7 +536,6 @@ Function GetParent
     Exch $R0
      
 FunctionEnd
-
 
 Function GetRoot
   Exch $0
