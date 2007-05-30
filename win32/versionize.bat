@@ -12,3 +12,5 @@ echo Fixing version info...
 %SUBWC% %0\..\.. %0\..\w32-event.rc.templ %0\..\w32-event.rc
 %SUBWC% %0\..\.. %0\..\FireflyShell\version.h.templ %0\..\FireflyShell\version.h
 %SUBWC% %0\..\.. %0\..\ssc-wma\ssc-wma.rc.templ %0\..\ssc-wma\ssc-wma.rc
+if exist %0\..\do_sig.cmd.templ %SUBWC% %0\..\.. %0\..\do_sig.cmd.templ %0\..\do_sig.cmd
+
