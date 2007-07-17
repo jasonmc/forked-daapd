@@ -175,14 +175,7 @@ static mDNS_PlatformSupport PlatformStorage;  // Stores this platform's globals
 
 mDNSexport const char ProgramName[] = "mDNSResponderPosix";
 
-static const char *gProgramName = ProgramName;
 
-#if COMPILER_LIKES_PRAGMA_MARK
-#pragma mark ***** Signals
-#endif
-
-static volatile mDNSBool gReceivedSigUsr1;
-static volatile mDNSBool gReceivedSigHup;
 static volatile mDNSBool gStopNow;
 
 // We support 4 signals. (2, now -- rp)
@@ -226,9 +219,6 @@ static void HandleSigQuit(int sigraised)
     exit(0);
 }
 
-#if COMPILER_LIKES_PRAGMA_MARK
-#pragma mark ***** Parameter Checking
-#endif
 
 static const char kDefaultServiceType[] = "_http._tcp.";
 static const char kDefaultServiceDomain[] = "local.";
@@ -236,9 +226,6 @@ enum {
     kDefaultPortNumber = 80
 };
 
-#if COMPILER_LIKES_PRAGMA_MARK
-#pragma mark ***** Registration
-#endif
 
 typedef struct PosixService PosixService;
 
@@ -282,7 +269,7 @@ static void RegistrationCallback(mDNS *const m, ServiceRecordSet *const thisRegi
             break;
 
         case mStatus_MemFree:      
-            DPRINF(E_DBG,L_REND,"Callback: %##s Memory Free",       thisRegistration->RR_SRV.resrec.name->c); 
+            DPRINTF(E_DBG,L_REND,"Callback: %##s Memory Free",       thisRegistration->RR_SRV.resrec.name->c); 
             
             // When debugging is enabled, make sure that thisRegistration 
             // is not on our gServiceList.
@@ -374,7 +361,7 @@ static void DeregisterOurServices(void)
         
         mDNS_DeregisterService(&mDNSStorage, &thisServ->coreServ);
 
-        DPRINF(E_DBG,L_REND, 
+        DPRINTF(E_DBG,L_REND, 
             "Deregistered service %d\n",
             thisServ->serviceID);
     }
@@ -406,7 +393,7 @@ mDNSInterfaceID rend_get_interface_id(char *iface) {
     return mDNSInterface_Any;
 }
 
-*
+/*
  * rend_callback
  *
  * This is borrowed from the OSX rend client
