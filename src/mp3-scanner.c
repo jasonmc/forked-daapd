@@ -221,7 +221,8 @@ void scan_process_playlistlist(void) {
                 file = strrchr(pnext->path,PATHSEP) + 1;
             }
 
-            if(strcasecmp(file,"iTunes Music Library.xml") == 0) {
+            if((strcasecmp(file,"iTunes Music Library.xml") == 0) ||
+               (strcasecmp(file,"iTunes Library.xml") == 0)) {
                 if(conf_get_int("scanning","process_xml",1)) {
                     DPRINTF(E_INF,L_SCAN,"Scanning %s\n",pnext->path);
                     scan_xml_playlist(pnext->path);
