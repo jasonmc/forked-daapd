@@ -670,7 +670,7 @@ int ws_getheaders(WS_CONNINFO *pwsc) {
             last=first;
             strsep(&last,":");
 
-            if(last==first) {
+            if(!last) {
                 DPRINTF(E_WARN,L_WS,"Thread %d: Invalid header: %s\n",
                         pwsc->threadno,first);
             } else {
@@ -961,12 +961,11 @@ void *ws_dispatcher(void *arg) {
             if((auth_handler) && (auth_handler(pwsc,NULL,NULL)==0)) {
                 /* do the auth thing */
                 auth=ws_getarg(&pwsc->request_headers,"Authorization");
-                if(auth) {
-                    ws_decodepassword(auth,&username,&password);
+                if((auth) && (ws_decodepassword(auth,&username, &password) != -1)) {
                     if(auth_handler(pwsc,username,password))
                         can_dispatch=1;
-                    ws_addarg(&pwsc->request_vars,"HTTP_USER",username);
-                    ws_addarg(&pwsc->request_vars,"HTTP_PASSWD",password);
+                    ws_addarg(&pwsc->request_vars,"HTTP_USER","%s",username);
+                    ws_addarg(&pwsc->request_vars,"HTTP_PASSWD","%s",password);
                     free(username); /* this frees password too */
                 } 
 
@@ -1433,6 +1432,7 @@ int ws_decodepassword(char *header, char **username, char **password) {
     int pads=0;
     unsigned char *decodebuffer;
     unsigned char *pin, *pout;
+    char *type,*base64;
     int lookup;
 
     *username=NULL;
@@ -1461,21 +1461,33 @@ int ws_decodepassword(char *header, char **username, char **password) {
         return -1;
 
     /* xlat table is initialized */
-    while(*header != ' ')
+
+    // Trim leading spaces
+    while((*header) && (*header == ' '))
         header++;
 
-    header++;
+    // Should be in the form "Basic <base-64 enc username/pw>"
+    type=header;
+    base64 = strchr(header,' ');
+    if(!base64) {
+        // invalid auth header 
+        DPRINTF(E_DBG,L_WS,"Bad authentication header: %s\n",header);
+        return -1;
+    }
+    
+    *base64 = '\0';
+    base64++;
 
-    decodebuffer=(unsigned char *)malloc(strlen(header));
+    decodebuffer=(unsigned char *)malloc(strlen(base64));
     if(!decodebuffer)
         return -1;
 
-    DPRINTF(E_DBG,L_WS,"Preparing to decode %s\n",header);
+    DPRINTF(E_DBG,L_WS,"Preparing to decode %s\n",base64);
 
-    memset(decodebuffer,0,strlen(header));
+    memset(decodebuffer,0,strlen(base64));
     len=0;
     pout=decodebuffer;
-    pin=(unsigned char *)header;
+    pin=(unsigned char *)base64;
 
     /* this is more than a little sloppy */
     while(pin[rack]) {
