@@ -179,7 +179,7 @@ void err_log(int level, unsigned int cat, char *fmt, ...)
     }
     
     /* always log fatals and level 1 to syslog */
-    if(level <= 1) {
+    if(level < 1) {
         if(!err_syslog_open)
             os_opensyslog();
         err_syslog_open=1;
