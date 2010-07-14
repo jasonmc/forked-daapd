@@ -1,5 +1,5 @@
 .\"  -*- nroff -*-
-.TH FORKED-DAAPD "8" "2010-01-05" "forked-daapd" "RSP & DAAP media server"
+.TH FORKED-DAAPD "8" "2010-07-18" "forked-daapd" "RSP & DAAP media server"
 .SH NAME
 mt\-daapd \- RSP & iTunes\-compatible DAAP server
 .SH SYNOPSIS
@@ -20,6 +20,10 @@ Log level (0\-5).
 Debug domains; available domains are: \fIconfig\fP, \fIdaap\fP,
 \fIdb\fP, \fIhttpd\fP, \fImain\fP, \fImdns\fP, \fImisc\fP,
 \fIrsp\fP, \fIscan\fP, \fIxcode\fP, \fIevent\fP.
+.TP
+\fB\-s\fR
+Synchronous logging; logging is asynchronous by default. Use when
+debugging, especially if debugging a crash.
 .TP
 \fB\-c\fR \fIfile\fP
 Use \fIfile\fP as the configuration file.

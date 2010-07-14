@@ -27,8 +27,8 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <pthread.h>
 
+#include <dispatch/dispatch.h>
 #include <event.h>
 
 #include <libavutil/log.h>
@@ -37,7 +37,8 @@
 #include "logger.h"
 
 
-static pthread_mutex_t logger_lck = PTHREAD_MUTEX_INITIALIZER;
+static dispatch_queue_t logger_sq;
+static int logsync;
 static int logdomains;
 static int threshold;
 static int console;
@@ -82,6 +83,75 @@ static void
 vlogger(int severity, int domain, const char *fmt, va_list args)
 {
   va_list ap;
+  char *msg;
+  time_t t;
+  int ret;
+  dispatch_block_t logblock;
+
+  if (!((1 << domain) & logdomains) || (severity > threshold))
+    return;
+
+  t = time(NULL);
+
+  va_copy(ap, args);
+  ret = vsnprintf(NULL, 0, fmt, ap);
+  va_end(ap);
+
+  if (ret <= 0)
+    return;
+
+  msg = (char *)malloc(ret + 1);
+  if (!msg)
+    return;
+
+  va_copy(ap, args);
+  ret = vsnprintf(msg, ret + 1, fmt, ap);
+  va_end(ap);
+
+  if (ret < 0)
+    {
+      free(msg);
+      return;
+    }
+
+
+  logblock = ^{
+    char stamp[32];
+    int ret;
+
+    if (!logfile && !console)
+      {
+	free(msg);
+	return;
+      }
+
+    if (logfile)
+      {
+	ret = strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", localtime(&t));
+	if (ret == 0)
+	  stamp[0] = '\0';
+
+	fprintf(logfile, "[%s] %8s: %s", stamp, labels[domain], msg);
+
+	fflush(logfile);
+      }
+
+    if (console)
+      fprintf(stderr, "%8s: %s", labels[domain], msg);
+
+    free(msg);
+  };
+
+  if (logsync)
+    dispatch_sync(logger_sq, logblock);
+  else
+    dispatch_async(logger_sq, logblock);
+}
+
+static void
+vlogger_early(int severity, int domain, const char *fmt, va_list args)
+{
+  va_list ap;
   char stamp[32];
   time_t t;
   int ret;
@@ -89,13 +159,8 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
   if (!((1 << domain) & logdomains) || (severity > threshold))
     return;
 
-  pthread_mutex_lock(&logger_lck);
-
   if (!logfile && !console)
-    {
-      pthread_mutex_unlock(&logger_lck);
-      return;
-    }
+    return;
 
   if (logfile)
     {
@@ -121,8 +186,6 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
       vfprintf(stderr, fmt, ap);
       va_end(ap);
     }
-
-  pthread_mutex_unlock(&logger_lck);
 }
 
 void
@@ -131,7 +194,12 @@ DPRINTF(int severity, int domain, const char *fmt, ...)
   va_list ap;
 
   va_start(ap, fmt);
-  vlogger(severity, domain, fmt, ap);
+
+  if (!logger_sq)
+    vlogger_early(severity, domain, fmt, ap);
+  else
+    vlogger(severity, domain, fmt, ap);
+
   va_end(ap);
 }
 
@@ -196,33 +264,37 @@ logger_alsa(const char *file, int line, const char *function, int err, const cha
 }
 #endif /* LAUDIO_USE_ALSA */
 
-void
-logger_reinit(void)
+/* Queue: logger_sq */
+static void
+logger_reinit_task(void *arg)
 {
   FILE *fp;
 
   if (!logfile)
     return;
 
-  pthread_mutex_lock(&logger_lck);
-
   fp = fopen(logfilename, "a");
   if (!fp)
     {
-      fprintf(logfile, "Could not reopen logfile: %s\n", strerror(errno));
-
-      goto out;
+      DPRINTF(E_LOG, L_MAIN, "Could not reopen logfile: %s\n", strerror(errno));
+      return;
     }
 
   fclose(logfile);
   logfile = fp;
+}
 
- out:
-  pthread_mutex_unlock(&logger_lck);
+void
+logger_reinit(void)
+{
+  if (!logger_sq)
+    return;
+
+  dispatch_sync_f(logger_sq, NULL, logger_reinit_task);
 }
 
 
-/* The functions below are used at init time with a single thread running */
+/* The functions below are used at init time before switching to dispatch mode */
 void
 logger_domains(void)
 {
@@ -243,6 +315,18 @@ logger_detach(void)
 }
 
 int
+logger_start_dispatch(int sync)
+{
+  logger_sq = dispatch_queue_create("org.forked-daapd.logger", NULL);
+  if (!logger_sq)
+    return -1;
+
+  logsync = sync;
+
+  return 0;
+}
+
+int
 logger_init(char *file, char *domains, int severity)
 {
   int ret;
@@ -254,6 +338,7 @@ logger_init(char *file, char *domains, int severity)
       return -1;
     }
 
+  logger_sq = NULL;
   console = 1;
   threshold = severity;
 
@@ -293,6 +378,20 @@ logger_init(char *file, char *domains, int severity)
 void
 logger_deinit(void)
 {
-  if (logfile)
-    fclose(logfile);
+  if (logger_sq)
+    {
+      dispatch_sync(logger_sq,
+		     ^{
+		       if (logfile)
+			 fclose(logfile);
+		     });
+
+      dispatch_release(logger_sq);
+      logger_sq = NULL;
+    }
+  else
+    {
+      if (logfile)
+	fclose(logfile);
+    }
 }

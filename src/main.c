@@ -440,6 +440,7 @@ main(int argc, char **argv)
   int mdns_no_rsp;
   int mdns_no_daap;
   int loglevel;
+  int logsync;
   char *logdomains;
   char *logfile;
   char *ffid;
@@ -456,6 +457,7 @@ main(int argc, char **argv)
     {
       { "ffid",         1, NULL, 'b' },
       { "debug",        1, NULL, 'd' },
+      { "synclog",      0, NULL, 's' },
       { "logdomains",   1, NULL, 'D' },
       { "foreground",   0, NULL, 'f' },
       { "config",       1, NULL, 'c' },
@@ -471,6 +473,7 @@ main(int argc, char **argv)
   configfile = CONFFILE;
   pidfile = PIDFILE;
   loglevel = -1;
+  logsync = 0;
   logdomains = NULL;
   logfile = NULL;
   background = 1;
@@ -478,7 +481,7 @@ main(int argc, char **argv)
   mdns_no_rsp = 0;
   mdns_no_daap = 0;
 
-  while ((option = getopt_long(argc, argv, "D:d:c:P:fb:v", option_map, NULL)) != -1)
+  while ((option = getopt_long(argc, argv, "D:d:sc:P:fb:v", option_map, NULL)) != -1)
     {
       switch (option)
 	{
@@ -505,6 +508,10 @@ main(int argc, char **argv)
 	  case 'D':
 	    logdomains = optarg;
             break;
+
+	  case 's':
+	    logsync = 1;
+	    break;
 
           case 'f':
             background = 0;
@@ -633,6 +640,18 @@ main(int argc, char **argv)
       ret = EXIT_FAILURE;
       goto daemon_fail;
     }
+
+  /* Switch logger into dispatch mode (after forking) */
+  ret = logger_start_dispatch(logsync);
+  if (ret < 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Could not switch logger to dispatch mode\n");
+
+      ret = EXIT_FAILURE;
+      goto logger_dispatch_fail;
+    }
+
+  DPRINTF(E_DBG, L_MAIN, "Logger switched to dispatch mode\n");
 
   /* Initialize libevent (after forking) */
   evbase_main = event_init();
@@ -801,6 +820,7 @@ main(int argc, char **argv)
     }
 
  mdns_fail:
+ logger_dispatch_fail:
  daemon_fail:
   if (background)
     {

@@ -62,6 +62,9 @@ void
 logger_detach(void);
 
 int
+logger_start_dispatch(int sync);
+
+int
 logger_init(char *file, char *domains, int severity);
 
 void
