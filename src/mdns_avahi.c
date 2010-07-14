@@ -1,5 +1,5 @@
 /*
- * Avahi mDNS backend
+ * Avahi mDNS backend, with libdispatch polling
  *
  * Copyright (C) 2009-2011 Julien BLACHE <jb@jblache.org>
  *
@@ -34,7 +34,9 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
-#include <avahi-common/thread-watch.h>
+#include <dispatch/dispatch.h>
+
+#include <avahi-common/watch.h>
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
 #include <avahi-client/client.h>
@@ -45,10 +47,355 @@
 #include "mdns.h"
 
 
-static AvahiThreadedPoll *mdns_thread = NULL;
+static dispatch_queue_t mdns_sq;
+
 static AvahiClient *mdns_client = NULL;
 static AvahiEntryGroup *mdns_group = NULL;
 
+
+struct AvahiWatch
+{
+  int fd;
+
+  dispatch_source_t w_read;
+  dispatch_source_t w_write;
+
+  AvahiWatchCallback cb;
+  void *userdata;
+
+  AvahiWatch *next;
+};
+
+struct AvahiTimeout
+{
+  dispatch_source_t timer;
+
+  AvahiTimeoutCallback cb;
+  void *userdata;
+
+  AvahiTimeout *next;
+};
+
+static AvahiWatch *all_w;
+static AvahiTimeout *all_t;
+
+/* libdispatch callbacks */
+
+static
+void gcdpollcb_watch_read(void *arg)
+{
+  AvahiWatch *w;
+
+  w = (AvahiWatch *)arg;
+
+  w->cb(w, w->fd, AVAHI_WATCH_IN, w->userdata);
+}
+
+static
+void gcdpollcb_watch_write(void *arg)
+{
+  AvahiWatch *w;
+
+  w = (AvahiWatch *)arg;
+
+  w->cb(w, w->fd, AVAHI_WATCH_OUT, w->userdata);
+}
+
+/* timer cb (cancel + release) */
+static
+void gcdpollcb_timer(void *arg)
+{
+  AvahiTimeout *t;
+
+  t = (AvahiTimeout *)arg;
+
+  if (t->timer)
+    {
+      dispatch_source_cancel(t->timer);
+      dispatch_release(t->timer);
+      t->timer = NULL;
+    }
+
+  t->cb(t, t->userdata);
+}
+
+/* AvahiPoll implementation for GCD / libdispatch */
+
+static int
+_gcdpoll_watch_add(AvahiWatch *w, AvahiWatchEvent a_events)
+{
+  dispatch_source_t sr = NULL;
+  dispatch_source_t sw = NULL;
+
+  if ((a_events & AVAHI_WATCH_IN) && !w->w_read)
+    {
+      sr = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, w->fd, 0, mdns_sq);
+      if (!sr)
+	return -1;
+
+      dispatch_set_context(sr, w);
+      dispatch_source_set_event_handler_f(sr, gcdpollcb_watch_read);
+    }
+
+  if ((a_events & AVAHI_WATCH_OUT) && !w->w_write)
+    {
+      sw = dispatch_source_create(DISPATCH_SOURCE_TYPE_WRITE, w->fd, 0, mdns_sq);
+      if (!sw)
+	{
+	  if (sr)
+	    {
+	      dispatch_source_cancel(sr);
+	      dispatch_release(sr);
+	    }
+
+	  return -1;
+	}
+
+      dispatch_set_context(sw, w);
+      dispatch_source_set_event_handler_f(sw, gcdpollcb_watch_write);
+    }
+
+  if (sr)
+    {
+      w->w_read = sr;
+      dispatch_resume(sr);
+    }
+
+  if (sw)
+    {
+      w->w_write = sw;
+      dispatch_resume(sw);
+    }
+
+  return 0;
+}
+
+static AvahiWatch *
+gcdpoll_watch_new(const AvahiPoll *api, int fd, AvahiWatchEvent a_events, AvahiWatchCallback cb, void *userdata)
+{
+  AvahiWatch *w;
+  int ret;
+
+  w = (AvahiWatch *)malloc(sizeof(AvahiWatch));
+  if (!w)
+    return NULL;
+
+  memset(w, 0, sizeof(AvahiWatch));
+
+  w->fd = fd;
+  w->cb = cb;
+  w->userdata = userdata;
+
+  ret = _gcdpoll_watch_add(w, a_events);
+  if (ret != 0)
+    {
+      free(w);
+      return NULL;
+    }
+
+  w->next = all_w;
+  all_w = w;
+
+  return w;
+}
+
+static void
+gcdpoll_watch_update(AvahiWatch *w, AvahiWatchEvent a_events)
+{
+  if (w->w_read && !(a_events & AVAHI_WATCH_IN))
+    {
+      dispatch_source_cancel(w->w_read);
+      dispatch_release(w->w_read);
+
+      w->w_read = NULL;
+    }
+
+  if (w->w_write && !(a_events & AVAHI_WATCH_OUT))
+    {
+      dispatch_source_cancel(w->w_write);
+      dispatch_release(w->w_write);
+
+      w->w_write = NULL;
+    }
+
+  _gcdpoll_watch_add(w, a_events);
+}
+
+static AvahiWatchEvent
+gcdpoll_watch_get_events(AvahiWatch *w)
+{
+  /* Not implemented, unused in the Avahi codebase */
+  return 0;
+}
+
+static void
+gcdpoll_watch_free(AvahiWatch *w)
+{
+  AvahiWatch *prev;
+  AvahiWatch *cur;
+
+  if (w->w_read)
+    {
+      dispatch_source_cancel(w->w_read);
+      dispatch_release(w->w_read);
+    }
+
+  if (w->w_write)
+    {
+      dispatch_source_cancel(w->w_write);
+      dispatch_release(w->w_write);
+    }
+
+  prev = NULL;
+  for (cur = all_w; cur; prev = cur, cur = cur->next)
+    {
+      if (cur != w)
+	continue;
+
+      if (prev == NULL)
+	all_w = w->next;
+      else
+	prev->next = w->next;
+
+      break;
+    }
+
+  free(w);
+}
+
+
+static int
+_gcdpoll_timeout_add(AvahiTimeout *t, const struct timeval *tv)
+{
+  struct timeval e_tv;
+  struct timeval now;
+  int64_t nsecs;
+  int ret;
+
+  ret = gettimeofday(&now, NULL);
+  if (ret != 0)
+    return -1;
+
+  if (!t->timer)
+    {
+      t->timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, mdns_sq);
+      if (!t->timer)
+	return -1;
+
+      dispatch_set_context(t->timer, t);
+      dispatch_source_set_event_handler_f(t->timer, gcdpollcb_timer);
+    }
+  else
+    dispatch_suspend(t->timer);
+
+  if ((tv->tv_sec == 0) && (tv->tv_usec == 0))
+    {
+      dispatch_source_set_timer(t->timer,
+				DISPATCH_TIME_NOW,
+				DISPATCH_TIME_FOREVER /* one-shot */, 0);
+    }
+  else
+    {
+      timersub(tv, &now, &e_tv);
+
+      nsecs = e_tv.tv_sec * NSEC_PER_SEC + e_tv.tv_usec * 1000;
+
+      dispatch_source_set_timer(t->timer,
+				dispatch_time(DISPATCH_TIME_NOW, nsecs),
+				DISPATCH_TIME_FOREVER /* one-shot */, 0);
+    }
+
+  dispatch_resume(t->timer);
+
+  return 0;
+}
+
+static AvahiTimeout *
+gcdpoll_timeout_new(const AvahiPoll *api, const struct timeval *tv, AvahiTimeoutCallback cb, void *userdata)
+{
+  AvahiTimeout *t;
+  int ret;
+
+  t = (AvahiTimeout *)malloc(sizeof(AvahiTimeout));
+  if (!t)
+    return NULL;
+
+  memset(t, 0, sizeof(AvahiTimeout));
+
+  t->cb = cb;
+  t->userdata = userdata;
+
+  if (tv != NULL)
+    {
+      ret = _gcdpoll_timeout_add(t, tv);
+      if (ret != 0)
+	{
+	  free(t);
+
+	  return NULL;
+	}
+    }
+
+  t->next = all_t;
+  all_t = t;
+
+  return t;
+}
+
+static void
+gcdpoll_timeout_update(AvahiTimeout *t, const struct timeval *tv)
+{
+  if (tv)
+    _gcdpoll_timeout_add(t, tv);
+  else if (t->timer)
+    {
+      dispatch_source_cancel(t->timer);
+      dispatch_release(t->timer);
+      t->timer = NULL;
+    }
+}
+
+static void
+gcdpoll_timeout_free(AvahiTimeout *t)
+{
+  AvahiTimeout *prev;
+  AvahiTimeout *cur;
+
+  if (t->timer)
+    {
+      dispatch_source_cancel(t->timer);
+      dispatch_release(t->timer);
+      t->timer = NULL;
+    }
+
+  prev = NULL;
+  for (cur = all_t; cur; prev = cur, cur = cur->next)
+    {
+      if (cur != t)
+	continue;
+
+      if (prev == NULL)
+	all_t = t->next;
+      else
+	prev->next = t->next;
+
+      break;
+    }
+
+  free(t);
+}
+
+static struct AvahiPoll gcdpoll_api =
+  {
+    .userdata = NULL,
+    .watch_new = gcdpoll_watch_new,
+    .watch_update = gcdpoll_watch_update,
+    .watch_get_events = gcdpoll_watch_get_events,
+    .watch_free = gcdpoll_watch_free,
+    .timeout_new = gcdpoll_timeout_new,
+    .timeout_update = gcdpoll_timeout_update,
+    .timeout_free = gcdpoll_timeout_free
+  };
 
 /* Avahi client callbacks & helpers */
 
@@ -632,7 +979,7 @@ client_callback(AvahiClient *c, AvahiClientState state, AVAHI_GCC_UNUSED void * 
 	    avahi_client_free(mdns_client);
 	    mdns_group = NULL;
 
-	    mdns_client = avahi_client_new(avahi_threaded_poll_get(mdns_thread), AVAHI_CLIENT_NO_FAIL,
+	    mdns_client = avahi_client_new(&gcdpoll_api, AVAHI_CLIENT_NO_FAIL,
 					   client_callback, NULL, &error);
 	    if (!mdns_client)
 	      {
@@ -661,70 +1008,83 @@ client_callback(AvahiClient *c, AvahiClientState state, AVAHI_GCC_UNUSED void * 
 
 /* mDNS interface - to be called only from the main thread */
 
+static void
+mdns_init_task(void *arg)
+{
+  int error;
+
+  mdns_client = avahi_client_new(&gcdpoll_api, AVAHI_CLIENT_NO_FAIL,
+				 client_callback, NULL, &error);
+  if (!mdns_client)
+    DPRINTF(E_WARN, L_MDNS, "mdns_init: Could not create Avahi client: %s\n",
+	    avahi_strerror(avahi_client_errno(mdns_client)));
+}
+
 int
 mdns_init(void)
 {
-  int error;
-  int ret;
-
   DPRINTF(E_DBG, L_MDNS, "Initializing Avahi mDNS\n");
 
+  all_w = NULL;
+  all_t = NULL;
   group_entries = NULL;
   browser_list = NULL;
 
-  mdns_thread = avahi_threaded_poll_new();
-  if (!mdns_thread)
+  mdns_sq = dispatch_queue_create("org.forked-daapd.mdns", NULL);
+  if (!mdns_sq)
     {
-      DPRINTF(E_FATAL, L_MDNS, "mdns_init: Could not create AvahiThreadedPoll object\n");
-
+      DPRINTF(E_FATAL, L_MDNS, "mdns_init: Could not create dispatch queue\n");
       return -1;
     }
 
-  mdns_client = avahi_client_new(avahi_threaded_poll_get(mdns_thread), AVAHI_CLIENT_NO_FAIL,
-				 client_callback, NULL, &error);
+  dispatch_sync_f(mdns_sq, NULL, mdns_init_task);
+
   if (!mdns_client)
-    {
-      DPRINTF(E_FATAL, L_MDNS, "mdns_init: Could not create Avahi client: %s\n",
-	      avahi_strerror(avahi_client_errno(mdns_client)));
-
-      goto client_fail;
-    }
-
-  ret = avahi_threaded_poll_start(mdns_thread);
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_MDNS, "mdns_init: AvahiThreadedPoll failed to start\n");
-
-      goto start_fail;
-    }
+    goto client_fail;
 
   return 0;
 
- start_fail:
-  avahi_client_free(mdns_client);
  client_fail:
-  avahi_threaded_poll_free(mdns_thread);
-
-  mdns_client = NULL;
-  mdns_thread = NULL;
+  dispatch_release(mdns_sq);
 
   return -1;
 }
 
-void
-mdns_deinit(void)
+static void
+mdns_deinit_task(void *arg)
 {
   struct mdns_group_entry *ge;
   struct mdns_browser *mb;
+  AvahiWatch *w;
+  AvahiTimeout *t;
 
   if (mdns_client)
+    avahi_client_free(mdns_client);
+
+  for (t = all_t; t; t = t->next)
     {
-      avahi_threaded_poll_lock(mdns_thread);
-      avahi_client_free(mdns_client);
-      avahi_threaded_poll_unlock(mdns_thread);
+      if (t->timer)
+	{
+	  dispatch_source_cancel(t->timer);
+	  dispatch_release(t->timer);
+	  t->timer = NULL;
+	}
     }
 
-  avahi_threaded_poll_free(mdns_thread);
+  for (w = all_w; w; w = w->next)
+    {
+      if (w->w_read)
+	{
+	  dispatch_source_cancel(w->w_read);
+	  dispatch_release(w->w_read);
+	}
+
+      if (w->w_write)
+	{
+	  dispatch_source_cancel(w->w_write);
+	  dispatch_release(w->w_write);
+	}
+    }
 
   for (ge = group_entries; group_entries; ge = group_entries)
     {
@@ -744,6 +1104,36 @@ mdns_deinit(void)
       free(mb->type);
       free(mb);
     }
+}
+
+void
+mdns_deinit(void)
+{
+  dispatch_sync_f(mdns_sq, NULL, mdns_deinit_task);
+
+  dispatch_release(mdns_sq);
+}
+
+static void
+mdns_register_task(void *arg)
+{
+  struct mdns_group_entry *ge;
+
+  ge = (struct mdns_group_entry *)arg;
+
+  DPRINTF(E_DBG, L_MDNS, "[ASYNC] Adding mDNS service %s/%s\n", ge->name, ge->type);
+
+  ge->next = group_entries;
+  group_entries = ge;
+
+  if (mdns_group)
+    {
+      DPRINTF(E_DBG, L_MDNS, "Resetting mDNS group\n");
+      avahi_entry_group_reset(mdns_group);
+    }
+
+  DPRINTF(E_DBG, L_MDNS, "Creating service group\n");
+  _create_services();
 }
 
 int
@@ -773,21 +1163,7 @@ mdns_register(char *name, char *type, int port, char **txt)
 
   ge->txt = txt_sl;
 
-  avahi_threaded_poll_lock(mdns_thread);
-
-  ge->next = group_entries;
-  group_entries = ge;
-
-  if (mdns_group)
-    {
-      DPRINTF(E_DBG, L_MDNS, "Resetting mDNS group\n");
-      avahi_entry_group_reset(mdns_group);
-    }
-
-  DPRINTF(E_DBG, L_MDNS, "Creating service group\n");
-  _create_services();
-
-  avahi_threaded_poll_unlock(mdns_thread);
+  dispatch_async_f(mdns_sq, ge, mdns_register_task);
 
   return 0;
 }
@@ -796,7 +1172,7 @@ int
 mdns_browse(char *type, int flags, mdns_browse_cb cb)
 {
   struct mdns_browser *mb;
-  AvahiServiceBrowser *b;
+  __block AvahiServiceBrowser *b;
 
   DPRINTF(E_DBG, L_MDNS, "Adding service browser for type %s\n", type);
 
@@ -809,21 +1185,20 @@ mdns_browse(char *type, int flags, mdns_browse_cb cb)
 
   mb->flags = (flags) ? flags : MDNS_WANT_DEFAULT;
 
-  avahi_threaded_poll_lock(mdns_thread);
+  dispatch_sync(mdns_sq,
+		^{
+		  mb->next = browser_list;
+		  browser_list = mb;
 
-  mb->next = browser_list;
-  browser_list = mb;
+		  b = avahi_service_browser_new(mdns_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, type, NULL, 0, browse_callback, mb);
+		  if (!b)
+		    {
+		      DPRINTF(E_LOG, L_MDNS, "Failed to create service browser: %s\n",
+			      avahi_strerror(avahi_client_errno(mdns_client)));
 
-  b = avahi_service_browser_new(mdns_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, type, NULL, 0, browse_callback, mb);
-  if (!b)
-    {
-      DPRINTF(E_LOG, L_MDNS, "Failed to create service browser: %s\n",
-	      avahi_strerror(avahi_client_errno(mdns_client)));
-
-      browser_list = mb->next;
-    }
-
-  avahi_threaded_poll_unlock(mdns_thread);
+		      browser_list = mb->next;
+		    }
+		});
 
   if (!b)
     {
