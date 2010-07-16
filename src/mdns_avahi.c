@@ -1,5 +1,5 @@
 /*
- * Avahi mDNS backend, with libevent polling
+ * Avahi mDNS backend
  *
  * Copyright (C) 2009-2011 Julien BLACHE <jb@jblache.org>
  *
@@ -34,9 +34,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
-#include <event.h>
-
-#include <avahi-common/watch.h>
+#include <avahi-common/thread-watch.h>
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
 #include <avahi-client/client.h>
@@ -47,266 +45,9 @@
 #include "mdns.h"
 
 
-/* Main event base, from main.c */
-extern struct event_base *evbase_main;
-
+static AvahiThreadedPoll *mdns_thread = NULL;
 static AvahiClient *mdns_client = NULL;
 static AvahiEntryGroup *mdns_group = NULL;
-
-
-struct AvahiWatch
-{
-  struct event ev;
-
-  AvahiWatchCallback cb;
-  void *userdata;
-
-  AvahiWatch *next;
-};
-
-struct AvahiTimeout
-{
-  struct event ev;
-
-  AvahiTimeoutCallback cb;
-  void *userdata;
-
-  AvahiTimeout *next;
-};
-
-static AvahiWatch *all_w;
-static AvahiTimeout *all_t;
-
-/* libevent callbacks */
-
-static void
-evcb_watch(int fd, short ev_events, void *arg)
-{
-  AvahiWatch *w;
-  AvahiWatchEvent a_events;
-
-  w = (AvahiWatch *)arg;
-
-  a_events = 0;
-  if (ev_events & EV_READ)
-    a_events |= AVAHI_WATCH_IN;
-  if (ev_events & EV_WRITE)
-    a_events |= AVAHI_WATCH_OUT;
-
-  event_add(&w->ev, NULL);
-
-  w->cb(w, fd, a_events, w->userdata);
-}
-
-static void
-evcb_timeout(int fd, short ev_events, void *arg)
-{
-  AvahiTimeout *t;
-
-  t = (AvahiTimeout *)arg;
-
-  t->cb(t, t->userdata);
-}
-
-/* AvahiPoll implementation for libevent */
-
-static int
-_ev_watch_add(AvahiWatch *w, int fd, AvahiWatchEvent a_events)
-{
-  short ev_events;
-
-  ev_events = 0;
-  if (a_events & AVAHI_WATCH_IN)
-    ev_events |= EV_READ;
-  if (a_events & AVAHI_WATCH_OUT)
-    ev_events |= EV_WRITE;
-
-  event_set(&w->ev, fd, ev_events, evcb_watch, w);
-  event_base_set(evbase_main, &w->ev);
-
-  return event_add(&w->ev, NULL);
-}
-
-static AvahiWatch *
-ev_watch_new(const AvahiPoll *api, int fd, AvahiWatchEvent a_events, AvahiWatchCallback cb, void *userdata)
-{
-  AvahiWatch *w;
-  int ret;
-
-  w = (AvahiWatch *)malloc(sizeof(AvahiWatch));
-  if (!w)
-    return NULL;
-
-  memset(w, 0, sizeof(AvahiWatch));
-
-  w->cb = cb;
-  w->userdata = userdata;
-
-  ret = _ev_watch_add(w, fd, a_events);
-  if (ret != 0)
-    {
-      free(w);
-      return NULL;
-    }
-
-  w->next = all_w;
-  all_w = w;
-
-  return w;
-}
-
-static void
-ev_watch_update(AvahiWatch *w, AvahiWatchEvent a_events)
-{
-  event_del(&w->ev);
-
-  _ev_watch_add(w, EVENT_FD(&w->ev), a_events);
-}
-
-static AvahiWatchEvent
-ev_watch_get_events(AvahiWatch *w)
-{
-  AvahiWatchEvent a_events;
-
-  a_events = 0;
-
-  if (event_pending(&w->ev, EV_READ, NULL))
-    a_events |= AVAHI_WATCH_IN;
-  if (event_pending(&w->ev, EV_WRITE, NULL))
-    a_events |= AVAHI_WATCH_OUT;
-
-  return a_events;
-}
-
-static void
-ev_watch_free(AvahiWatch *w)
-{
-  AvahiWatch *prev;
-  AvahiWatch *cur;
-
-  event_del(&w->ev);
-
-  prev = NULL;
-  for (cur = all_w; cur; prev = cur, cur = cur->next)
-    {
-      if (cur != w)
-	continue;
-
-      if (prev == NULL)
-	all_w = w->next;
-      else
-	prev->next = w->next;
-
-      break;
-    }
-
-  free(w);
-}
-
-
-static int
-_ev_timeout_add(AvahiTimeout *t, const struct timeval *tv)
-{
-  struct timeval e_tv;
-  struct timeval now;
-  int ret;
-
-  evtimer_set(&t->ev, evcb_timeout, t);
-  event_base_set(evbase_main, &t->ev);
-
-  if ((tv->tv_sec == 0) && (tv->tv_usec == 0))
-    {
-      evutil_timerclear(&e_tv);
-    }
-  else
-    {
-      ret = gettimeofday(&now, NULL);
-      if (ret != 0)
-	return -1;
-
-      evutil_timersub(tv, &now, &e_tv);
-    }
-
-  return evtimer_add(&t->ev, &e_tv);
-}
-
-static AvahiTimeout *
-ev_timeout_new(const AvahiPoll *api, const struct timeval *tv, AvahiTimeoutCallback cb, void *userdata)
-{
-  AvahiTimeout *t;
-  int ret;
-
-  t = (AvahiTimeout *)malloc(sizeof(AvahiTimeout));
-  if (!t)
-    return NULL;
-
-  memset(t, 0, sizeof(AvahiTimeout));
-
-  t->cb = cb;
-  t->userdata = userdata;
-
-  if (tv != NULL)
-    {
-      ret = _ev_timeout_add(t, tv);
-      if (ret != 0)
-	{
-	  free(t);
-
-	  return NULL;
-	}
-    }
-
-  t->next = all_t;
-  all_t = t;
-
-  return t;
-}
-
-static void
-ev_timeout_update(AvahiTimeout *t, const struct timeval *tv)
-{
-  event_del(&t->ev);
-
-  if (tv)
-    _ev_timeout_add(t, tv);
-}
-
-static void
-ev_timeout_free(AvahiTimeout *t)
-{
-  AvahiTimeout *prev;
-  AvahiTimeout *cur;
-
-  event_del(&t->ev);
-
-  prev = NULL;
-  for (cur = all_t; cur; prev = cur, cur = cur->next)
-    {
-      if (cur != t)
-	continue;
-
-      if (prev == NULL)
-	all_t = t->next;
-      else
-	prev->next = t->next;
-
-      break;
-    }
-
-  free(t);
-}
-
-static struct AvahiPoll ev_poll_api =
-  {
-    .userdata = NULL,
-    .watch_new = ev_watch_new,
-    .watch_update = ev_watch_update,
-    .watch_get_events = ev_watch_get_events,
-    .watch_free = ev_watch_free,
-    .timeout_new = ev_timeout_new,
-    .timeout_update = ev_timeout_update,
-    .timeout_free = ev_timeout_free
-  };
 
 
 /* Avahi client callbacks & helpers */
@@ -891,7 +632,7 @@ client_callback(AvahiClient *c, AvahiClientState state, AVAHI_GCC_UNUSED void * 
 	    avahi_client_free(mdns_client);
 	    mdns_group = NULL;
 
-	    mdns_client = avahi_client_new(&ev_poll_api, AVAHI_CLIENT_NO_FAIL,
+	    mdns_client = avahi_client_new(avahi_threaded_poll_get(mdns_thread), AVAHI_CLIENT_NO_FAIL,
 					   client_callback, NULL, &error);
 	    if (!mdns_client)
 	      {
@@ -924,25 +665,50 @@ int
 mdns_init(void)
 {
   int error;
+  int ret;
 
   DPRINTF(E_DBG, L_MDNS, "Initializing Avahi mDNS\n");
 
-  all_w = NULL;
-  all_t = NULL;
   group_entries = NULL;
   browser_list = NULL;
 
-  mdns_client = avahi_client_new(&ev_poll_api, AVAHI_CLIENT_NO_FAIL,
-				 client_callback, NULL, &error);
-  if (!mdns_client)
+  mdns_thread = avahi_threaded_poll_new();
+  if (!mdns_thread)
     {
-      DPRINTF(E_WARN, L_MDNS, "mdns_init: Could not create Avahi client: %s\n",
-	      avahi_strerror(avahi_client_errno(mdns_client)));
+      DPRINTF(E_FATAL, L_MDNS, "mdns_init: Could not create AvahiThreadedPoll object\n");
 
       return -1;
     }
 
+  mdns_client = avahi_client_new(avahi_threaded_poll_get(mdns_thread), AVAHI_CLIENT_NO_FAIL,
+				 client_callback, NULL, &error);
+  if (!mdns_client)
+    {
+      DPRINTF(E_FATAL, L_MDNS, "mdns_init: Could not create Avahi client: %s\n",
+	      avahi_strerror(avahi_client_errno(mdns_client)));
+
+      goto client_fail;
+    }
+
+  ret = avahi_threaded_poll_start(mdns_thread);
+  if (ret < 0)
+    {
+      DPRINTF(E_FATAL, L_MDNS, "mdns_init: AvahiThreadedPoll failed to start\n");
+
+      goto start_fail;
+    }
+
   return 0;
+
+ start_fail:
+  avahi_client_free(mdns_client);
+ client_fail:
+  avahi_threaded_poll_free(mdns_thread);
+
+  mdns_client = NULL;
+  mdns_thread = NULL;
+
+  return -1;
 }
 
 void
@@ -950,14 +716,15 @@ mdns_deinit(void)
 {
   struct mdns_group_entry *ge;
   struct mdns_browser *mb;
-  AvahiWatch *w;
-  AvahiTimeout *t;
 
-  for (t = all_t; t; t = t->next)
-    event_del(&t->ev);
+  if (mdns_client)
+    {
+      avahi_threaded_poll_lock(mdns_thread);
+      avahi_client_free(mdns_client);
+      avahi_threaded_poll_unlock(mdns_thread);
+    }
 
-  for (w = all_w; w; w = w->next)
-    event_del(&w->ev);
+  avahi_threaded_poll_free(mdns_thread);
 
   for (ge = group_entries; group_entries; ge = group_entries)
     {
@@ -977,9 +744,6 @@ mdns_deinit(void)
       free(mb->type);
       free(mb);
     }
-
-  if (mdns_client)
-    avahi_client_free(mdns_client);
 }
 
 int
@@ -1009,6 +773,8 @@ mdns_register(char *name, char *type, int port, char **txt)
 
   ge->txt = txt_sl;
 
+  avahi_threaded_poll_lock(mdns_thread);
+
   ge->next = group_entries;
   group_entries = ge;
 
@@ -1020,6 +786,8 @@ mdns_register(char *name, char *type, int port, char **txt)
 
   DPRINTF(E_DBG, L_MDNS, "Creating service group\n");
   _create_services();
+
+  avahi_threaded_poll_unlock(mdns_thread);
 
   return 0;
 }
@@ -1041,6 +809,8 @@ mdns_browse(char *type, int flags, mdns_browse_cb cb)
 
   mb->flags = (flags) ? flags : MDNS_WANT_DEFAULT;
 
+  avahi_threaded_poll_lock(mdns_thread);
+
   mb->next = browser_list;
   browser_list = mb;
 
@@ -1051,6 +821,12 @@ mdns_browse(char *type, int flags, mdns_browse_cb cb)
 	      avahi_strerror(avahi_client_errno(mdns_client)));
 
       browser_list = mb->next;
+    }
+
+  avahi_threaded_poll_unlock(mdns_thread);
+
+  if (!b)
+    {
       free(mb->type);
       free(mb);
 
