@@ -476,6 +476,13 @@ db_watch_enum_fetchwd(struct watch_enum *we, uint32_t *wd);
 
 
 int
+db_pool_get(void);
+
+void
+db_pool_release(void);
+
+
+int
 db_perthread_init(void);
 
 void

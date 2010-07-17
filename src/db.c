@@ -36,6 +36,8 @@
 
 #include <pthread.h>
 
+#include <dispatch/dispatch.h>
+
 #include <sqlite3.h>
 
 #include "conffile.h"
@@ -51,6 +53,19 @@
 
 enum group_type {
   G_ALBUMS = 1,
+};
+
+#define DB_POOL_MIN_SIZE 4
+#define DB_POOL_MIN_FREE 2
+#define DB_POOL_MAX_AGE  (5 * 60)
+#define DB_POOL_MAX_AGE_NSEC (DB_POOL_MAX_AGE * NSEC_PER_SEC)
+
+struct db_pool_hdl {
+  sqlite3 *hdl;
+
+  time_t last;
+
+  struct db_pool_hdl *next;
 };
 
 struct db_unlock {
@@ -267,6 +282,13 @@ static const char *sort_clause[] =
 
 static char *db_path;
 static __thread sqlite3 *hdl;
+
+static dispatch_queue_t dbpool_sq;
+static dispatch_source_t pool_reclaim_timer;
+static int pool_size;
+static int pool_free_size;
+static struct db_pool_hdl *pool_free;
+static struct db_pool_hdl *pool_used;
 
 
 /* Forward */
@@ -3780,32 +3802,32 @@ db_xprofile(void *notused, const char *pquery, sqlite3_uint64 ptime)
 #endif
 
 
-int
-db_perthread_init(void)
+/* Database connections */
+static sqlite3 *
+db_conn_open(void)
 {
+  sqlite3 *conn;
   char *errmsg;
   int ret;
 
-  ret = sqlite3_open(db_path, &hdl);
+  ret = sqlite3_open(db_path, &conn);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not open database: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not open database: %s\n", sqlite3_errmsg(conn));
 
-      sqlite3_close(hdl);
-      return -1;
+      goto fail;
     }
 
-  ret = sqlite3_enable_load_extension(hdl, 1);
+  ret = sqlite3_enable_load_extension(conn, 1);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not enable extension loading\n");
 
-      sqlite3_close(hdl);
-      return -1;
+      goto fail;
     }
 
   errmsg = NULL;
-  ret = sqlite3_load_extension(hdl, PKGLIBDIR "/forked-daapd-sqlext.so", NULL, &errmsg);
+  ret = sqlite3_load_extension(conn, PKGLIBDIR "/forked-daapd-sqlext.so", NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       if (errmsg)
@@ -3814,24 +3836,314 @@ db_perthread_init(void)
 	  sqlite3_free(errmsg);
 	}
       else
-	DPRINTF(E_LOG, L_DB, "Could not load SQLite extension: %s\n", sqlite3_errmsg(hdl));
+	DPRINTF(E_LOG, L_DB, "Could not load SQLite extension: %s\n", sqlite3_errmsg(conn));
 
-      sqlite3_close(hdl);
-      return -1;
+      goto fail;
     }
 
-  ret = sqlite3_enable_load_extension(hdl, 0);
+  ret = sqlite3_enable_load_extension(conn, 0);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Could not disable extension loading\n");
 
-      sqlite3_close(hdl);
-      return -1;
+      goto fail;
     }
 
 #ifdef DB_PROFILE
-  sqlite3_profile(hdl, db_xprofile, NULL);
+  sqlite3_profile(conn, db_xprofile, NULL);
 #endif
+
+  return conn;
+
+ fail:
+  sqlite3_close(conn);
+
+  return NULL;
+}
+
+static void
+db_conn_close(sqlite3 *conn)
+{
+  sqlite3_stmt *stmt;
+
+  /* Tear down anything that's in flight */
+  while ((stmt = sqlite3_next_stmt(conn, 0)))
+    sqlite3_finalize(stmt);
+
+  sqlite3_close(conn);
+}
+
+
+/* Database connection pool */
+static int
+db_pool_open(void)
+{
+  struct db_pool_hdl *ph;
+
+  ph = (struct db_pool_hdl *)malloc(sizeof(struct db_pool_hdl));
+  if (!ph)
+    {
+      DPRINTF(E_LOG, L_DB, "Out of memory for database connection pool\n");
+
+      return -1;
+    }
+
+  memset(ph, 0, sizeof(struct db_pool_hdl));
+
+  ph->hdl = db_conn_open();
+  if (!ph->hdl)
+    {
+      free(ph);
+      return -1;
+    }
+
+  pool_size++;
+
+  ph->next = pool_free;
+  pool_free = ph;
+
+  return 0;
+}
+
+static void
+db_pool_close(struct db_pool_hdl *ph)
+{
+  pool_size--;
+
+  db_conn_close(ph->hdl);
+  free(ph);
+}
+
+static void
+db_pool_reclaim(void *arg)
+{
+  struct db_pool_hdl *ph;
+  struct db_pool_hdl *ph_prev;
+  time_t threshold;
+  int reclaimed;
+
+  DPRINTF(E_DBG, L_DB, "DB pool status: size %d free %d\n", pool_size, pool_free_size);
+
+  if (pool_free_size <= DB_POOL_MIN_FREE)
+    return;
+
+  threshold = time(NULL) - DB_POOL_MAX_AGE;
+  reclaimed = 0;
+
+  ph_prev = NULL;
+  for (ph = pool_free; ph && (pool_free_size > DB_POOL_MIN_FREE); /* EMPTY */)
+    {
+      if (ph->last <= threshold)
+	{
+	  if (ph_prev)
+	    ph_prev->next = ph->next;
+	  else
+	    pool_free = ph->next;
+
+	  db_pool_close(ph);
+
+	  reclaimed++;
+	  pool_free_size--;
+
+	  if (ph_prev)
+	    ph = ph_prev->next;
+	  else
+	    ph = pool_free;
+	}
+      else
+	{
+	  ph_prev = ph;
+	  ph = ph->next;
+	}
+    }
+
+  DPRINTF(E_DBG, L_DB, "DB pool status: reclaimed %d size %d free %d\n", reclaimed, pool_size, pool_free_size);
+}
+
+static void
+db_pool_get_task(void *arg)
+{
+  struct db_pool_hdl *ph;
+  sqlite3 **my_hdl;
+  int ret;
+
+  my_hdl = (sqlite3 **)arg;
+
+  if (!pool_free)
+    {
+      ret = db_pool_open();
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DB, "Could not open a new database connection; no free connections available\n");
+
+	  return;
+	}
+    }
+  else
+    pool_free_size--;
+
+  /* Remove from free list */
+  ph = pool_free;
+  pool_free = ph->next;
+
+  /* Add to used list */
+  ph->next = pool_used;
+  pool_used = ph;
+
+  *my_hdl = ph->hdl;
+}
+
+int
+db_pool_get(void)
+{
+  sqlite3 *my_hdl;
+
+  my_hdl = NULL;
+
+  dispatch_sync_f(dbpool_sq, &my_hdl, db_pool_get_task);
+
+  if (!my_hdl)
+    return -1;
+
+  /* Set thread-local database handle */
+  hdl = my_hdl;
+
+  return 0;
+}
+
+static void
+db_pool_release_task(void *arg)
+{
+  struct db_pool_hdl *ph;
+  struct db_pool_hdl *ph_prev;
+  sqlite3 *my_hdl;
+
+  my_hdl = (sqlite3 *)arg;
+
+  ph_prev = NULL;
+
+  for (ph = pool_used; ph; ph = ph->next)
+    {
+      if (ph->hdl == my_hdl)
+	break;
+
+      ph_prev = ph;
+    }
+
+  if (!ph)
+    return;
+
+  /* Remove from used list */
+  if (!ph_prev)
+    pool_used = ph->next;
+  else
+    ph_prev->next = ph->next;
+
+  /* Add to free list */
+  ph->next = pool_free;
+  pool_free = ph;
+
+  ph->last = time(NULL);
+  pool_free_size++;
+}
+
+void
+db_pool_release(void)
+{
+  sqlite3 *my_hdl;
+
+  /* Copy thread-local database handle */
+  my_hdl = hdl;
+
+  /* Reset thread-local database handle */
+  hdl = NULL;
+
+  dispatch_sync_f(dbpool_sq, my_hdl, db_pool_release_task);
+}
+
+static int
+db_pool_init(void)
+{
+  time_t now;
+  int ret;
+
+  pool_size = 0;
+  pool_free_size = 0;
+  pool_free = 0;
+  pool_used = 0;
+
+  dbpool_sq = dispatch_queue_create("org.forked-daapd.db-pool", NULL);
+  if (!dbpool_sq)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not create dispatch queue for database pool\n");
+
+      return -1;
+    }
+
+  now = time(NULL);
+
+  for (pool_size = 0; pool_size < DB_POOL_MIN_SIZE; pool_free_size++)
+    {
+      ret = db_pool_open();
+      if (ret < 0)
+	return -1;
+
+      pool_free->last = now;
+    }
+
+  pool_reclaim_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dbpool_sq);
+  if (!pool_reclaim_timer)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not create timer for database pool reclaim\n");
+
+      return -1;
+    }
+
+  dispatch_source_set_timer(pool_reclaim_timer,
+			    dispatch_time(DISPATCH_TIME_NOW, DB_POOL_MAX_AGE_NSEC),
+			    DB_POOL_MAX_AGE_NSEC, 30 * NSEC_PER_SEC);
+  dispatch_source_set_event_handler_f(pool_reclaim_timer, db_pool_reclaim);
+  dispatch_resume(pool_reclaim_timer);
+
+  return 0;
+}
+
+static void
+db_pool_deinit(void)
+{
+  struct db_pool_hdl *ph;
+
+  dispatch_source_cancel(pool_reclaim_timer);
+  dispatch_release(pool_reclaim_timer);
+
+  dispatch_sync(dbpool_sq,
+		^{
+		  /* Nothing to do, just resynching with the queue */
+		});
+
+  dispatch_release(dbpool_sq);
+
+  if (pool_used)
+    DPRINTF(E_LOG, L_DB, "db_pool_deinit: some connections are still in use!\n");
+
+  for (ph = pool_free; pool_free; ph = pool_free)
+    {
+      pool_free = ph->next;
+
+      db_conn_close(ph->hdl);
+      free(ph);
+    }
+}
+
+
+/* Per-thread database handles */
+
+int
+db_perthread_init(void)
+{
+  hdl = db_conn_open();
+  if (!hdl)
+    return -1;
 
   return 0;
 }
@@ -3839,16 +4151,12 @@ db_perthread_init(void)
 void
 db_perthread_deinit(void)
 {
-  sqlite3_stmt *stmt;
-
   if (!hdl)
     return;
 
-  /* Tear down anything that's in flight */
-  while ((stmt = sqlite3_next_stmt(hdl, 0)))
-    sqlite3_finalize(stmt);
+  db_conn_close(hdl);
 
-  sqlite3_close(hdl);
+  hdl = NULL;
 }
 
 
@@ -4812,6 +5120,7 @@ db_check_version(void)
 #undef Q_VACUUM
 }
 
+
 int
 db_init(void)
 {
@@ -4877,11 +5186,22 @@ db_init(void)
 
   DPRINTF(E_INFO, L_DB, "Database OK with %d active files and %d active playlists\n", files, pls);
 
+  ret = db_pool_init();
+  if (ret < 0)
+    {
+      DPRINTF(E_FATAL, L_DB, "Could not initialize database connection pool\n");
+
+      db_pool_deinit();
+      return -1;
+    }
+
   return 0;
 }
 
 void
 db_deinit(void)
 {
+  db_pool_deinit();
+
   sqlite3_shutdown();
 }
