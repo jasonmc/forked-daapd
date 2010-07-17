@@ -70,10 +70,32 @@ GCRY_THREAD_OPTION_PTHREAD_IMPL;
 
 #define PIDFILE   STATEDIR "/run/" PACKAGE ".pid"
 
+typedef enum {
+  SHUTDOWN_PLAN_NOMINAL = 0,
+
+  SHUTDOWN_FAIL_SIGNALFD,
+  SHUTDOWN_FAIL_MDNSREG,
+  SHUTDOWN_FAIL_REMOTE,
+  SHUTDOWN_FAIL_HTTPD,
+  SHUTDOWN_FAIL_PLAYER,
+  SHUTDOWN_FAIL_FILESCANNER,
+  SHUTDOWN_FAIL_DB,
+  SHUTDOWN_FAIL_MDNS,
+  SHUTDOWN_FAIL_LOGGER,
+  SHUTDOWN_FAIL_DAEMON,
+  SHUTDOWN_FAIL_SIGNAL,
+  SHUTDOWN_FAIL_GCRYPT,
+  SHUTDOWN_FAIL_FFMPEG,
+} shutdown_plan_t;
+
+
 struct event_base *evbase_main;
 
 static struct event sig_event;
 static int main_exit;
+static char *pidfile;
+static int background;
+
 
 static void
 version(void)
@@ -105,7 +127,7 @@ usage(char *program)
 }
 
 static int
-daemonize(int background, char *pidfile)
+daemonize(void)
 {
   FILE *fp;
   pid_t childpid;
@@ -431,12 +453,14 @@ ffmpeg_lockmgr(void **mutex, enum AVLockOp op)
 }
 
 
+static void
+app_shutdown(shutdown_plan_t plan);
+
 int
 main(int argc, char **argv)
 {
   int option;
   char *configfile;
-  int background;
   int mdns_no_rsp;
   int mdns_no_daap;
   int loglevel;
@@ -444,13 +468,13 @@ main(int argc, char **argv)
   char *logdomains;
   char *logfile;
   char *ffid;
-  char *pidfile;
   const char *gcry_version;
   sigset_t sigs;
   int sigfd;
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
   struct kevent ke_sigs[4];
 #endif
+  shutdown_plan_t shutdown_plan;
   int ret;
 
   struct option option_map[] =
@@ -480,6 +504,7 @@ main(int argc, char **argv)
   ffid = NULL;
   mdns_no_rsp = 0;
   mdns_no_daap = 0;
+  shutdown_plan = SHUTDOWN_PLAN_NOMINAL;
 
   while ((option = getopt_long(argc, argv, "D:d:sc:P:fb:v", option_map, NULL)) != -1)
     {
@@ -584,8 +609,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not register ffmpeg lock manager callback\n");
 
-      ret = EXIT_FAILURE;
-      goto ffmpeg_init_fail;
+      shutdown_plan = SHUTDOWN_FAIL_FFMPEG;
+      goto startup_fail;
     }
 
   av_register_all();
@@ -602,8 +627,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "libgcrypt version mismatch\n");
 
-      ret = EXIT_FAILURE;
-      goto gcrypt_init_fail;
+      shutdown_plan = SHUTDOWN_FAIL_GCRYPT;
+      goto startup_fail;
     }
 
   /* We aren't handling anything sensitive, so give up on secure
@@ -627,18 +652,18 @@ main(int argc, char **argv)
     {
       DPRINTF(E_LOG, L_MAIN, "Error setting signal set\n");
 
-      ret = EXIT_FAILURE;
-      goto signal_block_fail;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
+      goto startup_fail;
     }
 
   /* Daemonize and drop privileges */
-  ret = daemonize(background, pidfile);
+  ret = daemonize();
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_MAIN, "Could not initialize server\n");
 
-      ret = EXIT_FAILURE;
-      goto daemon_fail;
+      shutdown_plan = SHUTDOWN_FAIL_DAEMON;
+      goto startup_fail;
     }
 
   /* Switch logger into dispatch mode (after forking) */
@@ -647,8 +672,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not switch logger to dispatch mode\n");
 
-      ret = EXIT_FAILURE;
-      goto logger_dispatch_fail;
+      shutdown_plan = SHUTDOWN_FAIL_LOGGER;
+      goto startup_fail;
     }
 
   DPRINTF(E_DBG, L_MAIN, "Logger switched to dispatch mode\n");
@@ -662,8 +687,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "mDNS init failed\n");
 
-      ret = EXIT_FAILURE;
-      goto mdns_fail;
+      shutdown_plan = SHUTDOWN_FAIL_MDNS;
+      goto startup_fail;
     }
 
   /* Initialize the database before starting */
@@ -673,8 +698,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Database init failed\n");
 
-      ret = EXIT_FAILURE;
-      goto db_fail;
+      shutdown_plan = SHUTDOWN_FAIL_DB;
+      goto startup_fail;
     }
 
   /* Open a DB connection for the main thread */
@@ -683,8 +708,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not perform perthread DB init for main\n");
 
-      ret = EXIT_FAILURE;
-      goto db_fail;
+      shutdown_plan = SHUTDOWN_FAIL_DB;
+      goto startup_fail;
     }
 
   /* Spawn file scanner thread */
@@ -693,8 +718,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "File scanner thread failed to start\n");
 
-      ret = EXIT_FAILURE;
-      goto filescanner_fail;
+      shutdown_plan = SHUTDOWN_FAIL_FILESCANNER;
+      goto startup_fail;
     }
 
   /* Spawn player thread */
@@ -703,8 +728,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Player thread failed to start\n");
 
-      ret = EXIT_FAILURE;
-      goto player_fail;
+      shutdown_plan = SHUTDOWN_FAIL_PLAYER;
+      goto startup_fail;
     }
 
   /* Spawn HTTPd thread */
@@ -713,8 +738,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "HTTPd thread failed to start\n");
 
-      ret = EXIT_FAILURE;
-      goto httpd_fail;
+      shutdown_plan = SHUTDOWN_FAIL_HTTPD;
+      goto startup_fail;
     }
 
   /* Start Remote pairing service */
@@ -723,16 +748,16 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Remote pairing service failed to start\n");
 
-      ret = EXIT_FAILURE;
-      goto remote_fail;
+      shutdown_plan = SHUTDOWN_FAIL_REMOTE;
+      goto startup_fail;
     }
 
   /* Register mDNS services */
   ret = register_services(ffid, mdns_no_rsp, mdns_no_daap);
   if (ret < 0)
     {
-      ret = EXIT_FAILURE;
-      goto mdns_reg_fail;
+      shutdown_plan = SHUTDOWN_FAIL_MDNSREG;
+      goto startup_fail;
     }
 
 #if defined(__linux__)
@@ -742,8 +767,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not setup signalfd: %s\n", strerror(errno));
 
-      ret = EXIT_FAILURE;
-      goto signalfd_fail;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNALFD;
+      goto startup_fail;
     }
 
   event_set(&sig_event, sigfd, EV_READ, signal_signalfd_cb, NULL);
@@ -754,8 +779,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not setup kqueue: %s\n", strerror(errno));
 
-      ret = EXIT_FAILURE;
-      goto signalfd_fail;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNALFD;
+      goto startup_fail;
     }
 
   EV_SET(&ke_sigs[0], SIGINT, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
@@ -768,8 +793,8 @@ main(int argc, char **argv)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not register signal events: %s\n", strerror(errno));
 
-      ret = EXIT_FAILURE;
-      goto signalfd_fail;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNALFD;
+      goto startup_fail;
     }
 
   event_set(&sig_event, sigfd, EV_READ, signal_kqueue_cb, NULL);
@@ -781,68 +806,110 @@ main(int argc, char **argv)
   /* Run the loop */
   event_base_dispatch(evbase_main);
 
-  DPRINTF(E_LOG, L_MAIN, "Stopping gracefully\n");
-  ret = EXIT_SUCCESS;
+ startup_fail:
+  app_shutdown(shutdown_plan);
 
-  /*
-   * On a clean shutdown, bring mDNS down first to give a chance
-   * to the clients to perform a clean shutdown on their end
-   */
-  DPRINTF(E_LOG, L_MAIN, "mDNS deinit\n");
-  mdns_deinit();
+  /* NOT REACHED */
 
- signalfd_fail:
- mdns_reg_fail:
-  DPRINTF(E_LOG, L_MAIN, "Remote pairing deinit\n");
-  remote_pairing_deinit();
+  exit(EXIT_FAILURE);
 
- remote_fail:
-  DPRINTF(E_LOG, L_MAIN, "HTTPd deinit\n");
-  httpd_deinit();
+  return 0;
+}
 
- httpd_fail:
-  DPRINTF(E_LOG, L_MAIN, "Player deinit\n");
-  player_deinit();
+static void
+app_shutdown(shutdown_plan_t plan)
+{
+  int ret;
 
- player_fail:
-  DPRINTF(E_LOG, L_MAIN, "File scanner deinit\n");
-  filescanner_deinit();
+  ret = EXIT_FAILURE;
 
- filescanner_fail:
-  DPRINTF(E_LOG, L_MAIN, "Database deinit\n");
-  db_perthread_deinit();
-  db_deinit();
- db_fail:
-  if (ret == EXIT_FAILURE)
+  switch (plan)
     {
-      DPRINTF(E_LOG, L_MAIN, "mDNS deinit\n");
-      mdns_deinit();
+      case SHUTDOWN_PLAN_NOMINAL:
+	DPRINTF(E_LOG, L_MAIN, "Stopping gracefully\n");
+	ret = EXIT_SUCCESS;
+
+	/*
+	 * On a clean shutdown, bring mDNS down first to give a chance
+	 * to the clients to perform a clean shutdown on their end
+	 */
+	DPRINTF(E_LOG, L_MAIN, "mDNS deinit\n");
+	mdns_deinit();
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_SIGNALFD:
+      case SHUTDOWN_FAIL_MDNSREG:
+	DPRINTF(E_LOG, L_MAIN, "Remote pairing deinit\n");
+	remote_pairing_deinit();
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_REMOTE:
+	DPRINTF(E_LOG, L_MAIN, "HTTPd deinit\n");
+	httpd_deinit();
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_HTTPD:
+	DPRINTF(E_LOG, L_MAIN, "Player deinit\n");
+	player_deinit();
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_PLAYER:
+	DPRINTF(E_LOG, L_MAIN, "File scanner deinit\n");
+	filescanner_deinit();
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_FILESCANNER:
+	DPRINTF(E_LOG, L_MAIN, "Database deinit\n");
+	db_perthread_deinit();
+	db_deinit();
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_DB:
+	if (ret == EXIT_FAILURE)
+	  {
+	    DPRINTF(E_LOG, L_MAIN, "mDNS deinit\n");
+	    mdns_deinit();
+	  }
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_MDNS:
+      case SHUTDOWN_FAIL_LOGGER:
+      case SHUTDOWN_FAIL_DAEMON:
+	if (background)
+	  {
+	    ret = seteuid(0);
+	    if (ret < 0)
+	      DPRINTF(E_LOG, L_MAIN, "seteuid() failed: %s\n", strerror(errno));
+	    else
+	      {
+		ret = unlink(pidfile);
+		if (ret < 0)
+		  DPRINTF(E_LOG, L_MAIN, "Could not unlink PID file %s: %s\n", pidfile, strerror(errno));
+	      }
+	  }
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_SIGNAL:
+      case SHUTDOWN_FAIL_GCRYPT:
+	av_lockmgr_register(NULL);
+
+	/* FALLTHROUGH */
+
+      case SHUTDOWN_FAIL_FFMPEG:
+	DPRINTF(E_LOG, L_MAIN, "Exiting.\n");
+	conffile_unload();
+	logger_deinit();
+
+	break;
     }
 
- mdns_fail:
- logger_dispatch_fail:
- daemon_fail:
-  if (background)
-    {
-      ret = seteuid(0);
-      if (ret < 0)
-	DPRINTF(E_LOG, L_MAIN, "seteuid() failed: %s\n", strerror(errno));
-      else
-	{
-	  ret = unlink(pidfile);
-	  if (ret < 0)
-	    DPRINTF(E_LOG, L_MAIN, "Could not unlink PID file %s: %s\n", pidfile, strerror(errno));
-	}
-    }
-
- signal_block_fail:
- gcrypt_init_fail:
-  av_lockmgr_register(NULL);
-
- ffmpeg_init_fail:
-  DPRINTF(E_LOG, L_MAIN, "Exiting.\n");
-  conffile_unload();
-  logger_deinit();
-
-  return ret;
+  exit(ret);
 }
