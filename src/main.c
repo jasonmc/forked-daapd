@@ -37,14 +37,11 @@
 #include <grp.h>
 #include <stdint.h>
 
-#if defined(__linux__)
-# include <sys/signalfd.h>
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-# include <sys/time.h>
-# include <sys/event.h>
-#endif
+#include <sys/eventfd.h>
 
 #include <pthread.h>
+
+#include <dispatch/dispatch.h>
 
 #include <getopt.h>
 #include <event.h>
@@ -71,9 +68,12 @@ GCRY_THREAD_OPTION_PTHREAD_IMPL;
 #define PIDFILE   STATEDIR "/run/" PACKAGE ".pid"
 
 typedef enum {
+  SHUTDOWN_SIG_INT = -2,
+  SHUTDOWN_SIG_TERM = -1,
+
   SHUTDOWN_PLAN_NOMINAL = 0,
 
-  SHUTDOWN_FAIL_SIGNALFD,
+  SHUTDOWN_FAIL_SIGNAL,
   SHUTDOWN_FAIL_MDNSREG,
   SHUTDOWN_FAIL_REMOTE,
   SHUTDOWN_FAIL_HTTPD,
@@ -83,16 +83,20 @@ typedef enum {
   SHUTDOWN_FAIL_MDNS,
   SHUTDOWN_FAIL_LOGGER,
   SHUTDOWN_FAIL_DAEMON,
-  SHUTDOWN_FAIL_SIGNAL,
   SHUTDOWN_FAIL_GCRYPT,
   SHUTDOWN_FAIL_FFMPEG,
 } shutdown_plan_t;
 
 
 struct event_base *evbase_main;
+static int exit_efd;
+static struct event exitev;
 
-static struct event sig_event;
-static int main_exit;
+static dispatch_source_t chld_src;
+static dispatch_source_t term_src;
+static dispatch_source_t int_src;
+static dispatch_source_t hup_src;
+
 static char *pidfile;
 static int background;
 
@@ -336,92 +340,13 @@ register_services(char *ffid, int no_rsp, int no_daap)
   return 0;
 }
 
-
-#if defined(__linux__)
 static void
-signal_signalfd_cb(int fd, short event, void *arg)
+exit_cb(int fd, short what, void *arg)
 {
-  struct signalfd_siginfo info;
-  int status;
+  event_base_loopbreak(evbase_main);
 
-  while (read(fd, &info, sizeof(struct signalfd_siginfo)) > 0)
-    {
-      switch (info.ssi_signo)
-	{
-	  case SIGCHLD:
-	    DPRINTF(E_LOG, L_MAIN, "Got SIGCHLD, reaping children\n");
-
-	    while (wait3(&status, WNOHANG, NULL) > 0)
-	      /* Nothing. */ ;
-	    break;
-
-	  case SIGINT:
-	  case SIGTERM:
-	    DPRINTF(E_LOG, L_MAIN, "Got SIGTERM or SIGINT\n");
-
-	    main_exit = 1;
-	    break;
-
-	  case SIGHUP:
-	    DPRINTF(E_LOG, L_MAIN, "Got SIGHUP\n");
-
-	    if (!main_exit)
-	      logger_reinit();
-	    break;
-	}
-    }
-
-  if (main_exit)
-    event_base_loopbreak(evbase_main);
-  else
-    event_add(&sig_event, NULL);
+  close(exit_efd);
 }
-
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-
-static void
-signal_kqueue_cb(int fd, short event, void *arg)
-{
-  struct timespec ts;
-  struct kevent ke;
-  int status;
-
-  ts.tv_sec = 0;
-  ts.tv_nsec = 0;
-
-  while (kevent(fd, NULL, 0, &ke, 1, &ts) > 0)
-    {
-      switch (ke.ident)
-	{
-	  case SIGCHLD:
-	    DPRINTF(E_LOG, L_MAIN, "Got SIGCHLD, reaping children\n");
-
-	    while (wait3(&status, WNOHANG, NULL) > 0)
-	      /* Nothing. */ ;
-	    break;
-
-	  case SIGINT:
-	  case SIGTERM:
-	    DPRINTF(E_LOG, L_MAIN, "Got SIGTERM or SIGINT\n");
-
-	    main_exit = 1;
-	    break;
-
-	  case SIGHUP:
-	    DPRINTF(E_LOG, L_MAIN, "Got SIGHUP\n");
-
-	    if (!main_exit)
-	      logger_reinit();
-	    break;
-	}
-    }
-
-  if (main_exit)
-    event_base_loopbreak(evbase_main);
-  else
-    event_add(&sig_event, NULL);
-}
-#endif
 
 
 static int
@@ -469,11 +394,7 @@ main(int argc, char **argv)
   char *logfile;
   char *ffid;
   const char *gcry_version;
-  sigset_t sigs;
-  int sigfd;
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-  struct kevent ke_sigs[4];
-#endif
+  dispatch_queue_t global_q;
   shutdown_plan_t shutdown_plan;
   int ret;
 
@@ -505,6 +426,11 @@ main(int argc, char **argv)
   mdns_no_rsp = 0;
   mdns_no_daap = 0;
   shutdown_plan = SHUTDOWN_PLAN_NOMINAL;
+
+  int_src = NULL;
+  term_src = NULL;
+  hup_src = NULL;
+  chld_src = NULL;
 
   while ((option = getopt_long(argc, argv, "D:d:sc:P:fb:v", option_map, NULL)) != -1)
     {
@@ -640,22 +566,6 @@ main(int argc, char **argv)
 
   DPRINTF(E_DBG, L_MAIN, "Initialized with gcrypt %s\n", gcry_version);
 
-  /* Block signals for all threads except the main one */
-  sigemptyset(&sigs);
-  sigaddset(&sigs, SIGINT);
-  sigaddset(&sigs, SIGHUP);
-  sigaddset(&sigs, SIGCHLD);
-  sigaddset(&sigs, SIGTERM);
-  sigaddset(&sigs, SIGPIPE);
-  ret = pthread_sigmask(SIG_BLOCK, &sigs, NULL);
-  if (ret != 0)
-    {
-      DPRINTF(E_LOG, L_MAIN, "Error setting signal set\n");
-
-      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
-      goto startup_fail;
-    }
-
   /* Daemonize and drop privileges */
   ret = daemonize();
   if (ret < 0)
@@ -760,51 +670,108 @@ main(int argc, char **argv)
       goto startup_fail;
     }
 
-#if defined(__linux__)
-  /* Set up signal fd */
-  sigfd = signalfd(-1, &sigs, SFD_NONBLOCK | SFD_CLOEXEC);
-  if (sigfd < 0)
+  /* Set up signal dispatch sources */
+  global_q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+  if (!global_q)
     {
-      DPRINTF(E_FATAL, L_MAIN, "Could not setup signalfd: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_MAIN, "Could not get global dispatch queue\n");
 
-      shutdown_plan = SHUTDOWN_FAIL_SIGNALFD;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
       goto startup_fail;
     }
 
-  event_set(&sig_event, sigfd, EV_READ, signal_signalfd_cb, NULL);
+  signal(SIGINT, SIG_IGN);
 
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-  sigfd = kqueue();
-  if (sigfd < 0)
+  int_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, global_q);
+  if (!int_src)
     {
-      DPRINTF(E_FATAL, L_MAIN, "Could not setup kqueue: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGINT\n");
 
-      shutdown_plan = SHUTDOWN_FAIL_SIGNALFD;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
       goto startup_fail;
     }
 
-  EV_SET(&ke_sigs[0], SIGINT, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
-  EV_SET(&ke_sigs[1], SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
-  EV_SET(&ke_sigs[2], SIGHUP, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
-  EV_SET(&ke_sigs[3], SIGCHLD, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+  dispatch_source_set_event_handler(int_src, ^{
+      app_shutdown(SHUTDOWN_SIG_INT);
+    });
 
-  ret = kevent(sigfd, ke_sigs, 4, NULL, 0, NULL);
-  if (ret < 0)
+  dispatch_resume(int_src);
+
+  signal(SIGTERM, SIG_IGN);
+
+  term_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, global_q);
+  if (!term_src)
     {
-      DPRINTF(E_FATAL, L_MAIN, "Could not register signal events: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGTERM\n");
 
-      shutdown_plan = SHUTDOWN_FAIL_SIGNALFD;
+      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
       goto startup_fail;
     }
 
-  event_set(&sig_event, sigfd, EV_READ, signal_kqueue_cb, NULL);
-#endif
+  dispatch_source_set_event_handler(term_src, ^{
+      app_shutdown(SHUTDOWN_SIG_TERM);
+    });
 
-  event_base_set(evbase_main, &sig_event);
-  event_add(&sig_event, NULL);
+  dispatch_resume(term_src);
+
+  signal(SIGHUP, SIG_IGN);
+
+  hup_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGHUP, 0, global_q);
+  if (!hup_src)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGHUP\n");
+
+      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
+      goto startup_fail;
+    }
+
+  dispatch_source_set_event_handler(hup_src, ^{
+      DPRINTF(E_LOG, L_MAIN, "Got SIGHUP\n");
+
+      logger_reinit();
+    });
+
+  dispatch_resume(hup_src);
+
+  signal(SIGCHLD, SIG_IGN);
+
+  chld_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGCHLD, 0, global_q);
+  if (!chld_src)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGCHLD\n");
+
+      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
+      goto startup_fail;
+    }
+
+  dispatch_source_set_event_handler(chld_src, ^{
+      int status;
+
+      DPRINTF(E_LOG, L_MAIN, "Got SIGCHLD, reaping children\n");
+
+      while (wait3(&status, WNOHANG, NULL) > 0)
+	/* Nothing. */ ;
+    });
+
+  dispatch_resume(chld_src);
+
+  /* Temporary eventfd for main thread cleanup */
+  exit_efd = eventfd(0, EFD_CLOEXEC);
+  if (exit_efd < 0)
+    DPRINTF(E_FATAL, L_MAIN, "Could not create eventfd: %s\n", strerror(errno));
+  else
+    {
+      event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
+      event_base_set(evbase_main, &exitev);
+      event_add(&exitev, NULL);
+    }
 
   /* Run the loop */
   event_base_dispatch(evbase_main);
+
+  /* Temporary main thread cleanup */
+  db_perthread_deinit();
+  pthread_exit(NULL);
 
  startup_fail:
   app_shutdown(shutdown_plan);
@@ -821,10 +788,34 @@ app_shutdown(shutdown_plan_t plan)
 {
   int ret;
 
+  if (int_src)
+    dispatch_source_cancel(int_src);
+  if (term_src)
+    dispatch_source_cancel(term_src);
+  if (hup_src)
+    dispatch_source_cancel(hup_src);
+  if (chld_src)
+    dispatch_source_cancel(chld_src);
+
+  if (int_src)
+    dispatch_release(int_src);
+  if (term_src)
+    dispatch_release(term_src);
+  if (hup_src)
+    dispatch_release(hup_src);
+  if (chld_src)
+    dispatch_release(chld_src);
+
   ret = EXIT_FAILURE;
 
   switch (plan)
     {
+      case SHUTDOWN_SIG_INT:
+      case SHUTDOWN_SIG_TERM:
+	DPRINTF(E_LOG, L_MAIN, "Got SIGTERM or SIGINT\n");
+
+	/* FALLTHROUGH */
+
       case SHUTDOWN_PLAN_NOMINAL:
 	DPRINTF(E_LOG, L_MAIN, "Stopping gracefully\n");
 	ret = EXIT_SUCCESS;
@@ -838,7 +829,7 @@ app_shutdown(shutdown_plan_t plan)
 
 	/* FALLTHROUGH */
 
-      case SHUTDOWN_FAIL_SIGNALFD:
+      case SHUTDOWN_FAIL_SIGNAL:
       case SHUTDOWN_FAIL_MDNSREG:
 	DPRINTF(E_LOG, L_MAIN, "Remote pairing deinit\n");
 	remote_pairing_deinit();
@@ -865,7 +856,6 @@ app_shutdown(shutdown_plan_t plan)
 
       case SHUTDOWN_FAIL_FILESCANNER:
 	DPRINTF(E_LOG, L_MAIN, "Database deinit\n");
-	db_perthread_deinit();
 	db_deinit();
 
 	/* FALLTHROUGH */
@@ -897,7 +887,6 @@ app_shutdown(shutdown_plan_t plan)
 
 	/* FALLTHROUGH */
 
-      case SHUTDOWN_FAIL_SIGNAL:
       case SHUTDOWN_FAIL_GCRYPT:
 	av_lockmgr_register(NULL);
 
@@ -909,6 +898,12 @@ app_shutdown(shutdown_plan_t plan)
 	logger_deinit();
 
 	break;
+    }
+
+  if (ret == EXIT_SUCCESS)
+    {
+      /* Main thread cleanup */
+      eventfd_write(exit_efd, 1);
     }
 
   exit(ret);
