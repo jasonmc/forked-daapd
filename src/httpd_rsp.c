@@ -28,12 +28,12 @@
 #include <string.h>
 #include <sys/queue.h>
 #include <sys/types.h>
-#include <regex.h>
 #include <limits.h>
 
 #include <event.h>
 #include "evhttp/evhttp.h"
 
+#include <tre/tre.h>
 #include <mxml.h>
 
 #include "logger.h"
@@ -819,7 +819,7 @@ rsp_request(struct evhttp_request *req)
   handler = -1;
   for (i = 0; rsp_handlers[i].handler; i++)
     {
-      ret = regexec(&rsp_handlers[i].preg, uri, 0, NULL, 0);
+      ret = tre_regexec(&rsp_handlers[i].preg, uri, 0, NULL, 0);
       if (ret == 0)
 	{
 	  handler = i;
@@ -905,10 +905,10 @@ rsp_init(void)
 
   for (i = 0; rsp_handlers[i].handler; i++)
     {
-      ret = regcomp(&rsp_handlers[i].preg, rsp_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
+      ret = tre_regcomp(&rsp_handlers[i].preg, rsp_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
       if (ret != 0)
         {
-          regerror(ret, &rsp_handlers[i].preg, buf, sizeof(buf));
+          tre_regerror(ret, &rsp_handlers[i].preg, buf, sizeof(buf));
 
           DPRINTF(E_FATAL, L_RSP, "RSP init failed; regexp error: %s\n", buf);
 	  return -1;
@@ -924,5 +924,5 @@ rsp_deinit(void)
   int i;
 
   for (i = 0; rsp_handlers[i].handler; i++)
-    regfree(&rsp_handlers[i].preg);
+    tre_regfree(&rsp_handlers[i].preg);
 }

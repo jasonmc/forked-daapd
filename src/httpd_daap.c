@@ -30,7 +30,6 @@
 #include <errno.h>
 #include <sys/queue.h>
 #include <sys/types.h>
-#include <regex.h>
 #include <limits.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -40,6 +39,8 @@
 
 #include <event.h>
 #include "evhttp/evhttp.h"
+
+#include <tre/tre.h>
 #include <avl.h>
 
 #include "logger.h"
@@ -2347,7 +2348,7 @@ daap_request(struct evhttp_request *req)
   handler = -1;
   for (i = 0; daap_handlers[i].handler; i++)
     {
-      ret = regexec(&daap_handlers[i].preg, uri, 0, NULL, 0);
+      ret = tre_regexec(&daap_handlers[i].preg, uri, 0, NULL, 0);
       if (ret == 0)
         {
           handler = i;
@@ -2497,10 +2498,10 @@ daap_init(void)
 
   for (i = 0; daap_handlers[i].handler; i++)
     {
-      ret = regcomp(&daap_handlers[i].preg, daap_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
+      ret = tre_regcomp(&daap_handlers[i].preg, daap_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
       if (ret != 0)
         {
-          regerror(ret, &daap_handlers[i].preg, buf, sizeof(buf));
+          tre_regerror(ret, &daap_handlers[i].preg, buf, sizeof(buf));
 
           DPRINTF(E_FATAL, L_DAAP, "DAAP init failed; regexp error: %s\n", buf);
 	  return -1;
@@ -2519,7 +2520,7 @@ daap_init(void)
 
  daap_avl_alloc_fail:
   for (i = 0; daap_handlers[i].handler; i++)
-    regfree(&daap_handlers[i].preg);
+    tre_regfree(&daap_handlers[i].preg);
 
   return -1;
 }
@@ -2531,7 +2532,7 @@ daap_deinit(void)
   int i;
 
   for (i = 0; daap_handlers[i].handler; i++)
-    regfree(&daap_handlers[i].preg);
+    tre_regfree(&daap_handlers[i].preg);
 
   avl_free_tree(daap_sessions);
 

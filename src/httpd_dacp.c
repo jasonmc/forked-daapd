@@ -28,7 +28,6 @@
 #include <errno.h>
 #include <sys/queue.h>
 #include <sys/types.h>
-#include <regex.h>
 #include <stdint.h>
 #include <inttypes.h>
 
@@ -39,6 +38,8 @@
 
 #include <event.h>
 #include "evhttp/evhttp.h"
+
+#include <tre/tre.h>
 
 #include "logger.h"
 #include "misc.h"
@@ -1609,7 +1610,7 @@ dacp_request(struct evhttp_request *req)
   handler = -1;
   for (i = 0; dacp_handlers[i].handler; i++)
     {
-      ret = regexec(&dacp_handlers[i].preg, uri, 0, NULL, 0);
+      ret = tre_regexec(&dacp_handlers[i].preg, uri, 0, NULL, 0);
       if (ret == 0)
         {
           handler = i;
@@ -1721,10 +1722,10 @@ dacp_init(void)
 
   for (i = 0; dacp_handlers[i].handler; i++)
     {
-      ret = regcomp(&dacp_handlers[i].preg, dacp_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
+      ret = tre_regcomp(&dacp_handlers[i].preg, dacp_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
       if (ret != 0)
         {
-          regerror(ret, &dacp_handlers[i].preg, buf, sizeof(buf));
+          tre_regerror(ret, &dacp_handlers[i].preg, buf, sizeof(buf));
 
           DPRINTF(E_FATAL, L_DACP, "DACP init failed; regexp error: %s\n", buf);
 	  goto regexp_fail;
@@ -1762,7 +1763,7 @@ dacp_deinit(void)
   player_set_update_handler(NULL);
 
   for (i = 0; dacp_handlers[i].handler; i++)
-    regfree(&dacp_handlers[i].preg);
+    tre_regfree(&dacp_handlers[i].preg);
 
   for (ur = update_requests; update_requests; ur = update_requests)
     {
