@@ -19,6 +19,10 @@ System-specific requirements:
    + libiconv
 
 Tools:
+ - The clang C compiler from the LLVM project. forked-daapd uses Blocks,
+   an extension to the C language that is not supported by gcc. Along with
+   clang, you'll also need the Blocks runtime, libblocksruntime.
+
  - pkg-config
  - gperf 3.x
         from <http://www.gnu.org/software/gperf/>
@@ -34,6 +38,8 @@ Libraries:
         from <http://libav.org/releases/>
  - libconfuse
         from <http://www.nongnu.org/confuse/>
+ - libdispatch
+        /!\ Read below
  - libevent 1.4+
         from <http://www.monkey.org/~provos/libevent/>
  - libavl
@@ -55,6 +61,11 @@ Libraries:
 
 If using binary packages, remember that you need the development packages to
 build forked-daapd (usually named -dev or -devel).
+
+libdispatch for Linux and its dependencies can be found in the Debian archive;
+you need at least libdispatch from SVN rev 197 + Debian patches (Linux support),
+libkqueue 0.9.2 and libpthread_workqueue 0.7. At this time, it's probably
+easiest to use whatever versions happen to be in Debian unstable.
 
 libavl is not the GNU libavl. There doesn't seem to be an upstream website
 anymore, but you'll find the source tarball alongside the forked-daapd
