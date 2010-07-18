@@ -35,7 +35,6 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <dirent.h>
-#include <pthread.h>
 
 #include <uninorm.h>
 
@@ -46,12 +45,7 @@
 # include <sys/event.h>
 #endif
 
-#if defined(HAVE_SYS_EVENTFD_H) && defined(HAVE_EVENTFD)
-# define USE_EVENTFD
-# include <sys/eventfd.h>
-#endif
-
-#include <event.h>
+#include <dispatch/dispatch.h>
 
 #include "logger.h"
 #include "db.h"
@@ -63,32 +57,20 @@
 
 #define F_SCAN_BULK    (1 << 0)
 #define F_SCAN_RESCAN  (1 << 1)
+#define F_SCAN_NODUP   (1 << 2)
 
-struct deferred_pl {
-  char *path;
-  struct deferred_pl *next;
-};
+static int stop_scan;
+static dispatch_group_t scanner_grp;
+static dispatch_queue_t deferred_pl_sq;
+static int ino_fd;
+static dispatch_source_t ino_src;
 
+
+#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 struct stacked_dir {
   char *path;
   struct stacked_dir *next;
 };
-
-
-#ifdef USE_EVENTFD
-static int exit_efd;
-#else
-static int exit_pipe[2];
-#endif
-static int scan_exit;
-static int inofd;
-static struct event_base *evbase_scan;
-static struct event inoev;
-static struct event exitev;
-static pthread_t tid_scan;
-static struct deferred_pl *playlists;
-static struct stacked_dir *dirstack;
-
 
 static int
 push_dir(struct stacked_dir **s, char *path)
@@ -132,6 +114,7 @@ pop_dir(struct stacked_dir **s)
 
   return ret;
 }
+#endif /* defined(__FreeBSD__) || defined(__FreeBSD_kernel__) */
 
 
 static void
@@ -293,7 +276,7 @@ fixup_tags(struct media_file_info *mfi)
     normalize_fixup_tag(&mfi->composer_sort, mfi->composer);
 }
 
-
+/* Queue: global */
 static void
 process_media_file(char *file, time_t mtime, off_t size, int compilation)
 {
@@ -402,6 +385,7 @@ process_media_file(char *file, time_t mtime, off_t size, int compilation)
   free_mfi(&mfi, 1);
 }
 
+/* Queue: global & deferred_pl_sq */
 static void
 process_playlist(char *file)
 {
@@ -419,61 +403,60 @@ process_playlist(char *file)
     }
 }
 
-/* Thread: scan */
+/* Queue: global */
 static void
 defer_playlist(char *path)
 {
-  struct deferred_pl *pl;
+  char *pl_path;
 
-  pl = (struct deferred_pl *)malloc(sizeof(struct deferred_pl));
-  if (!pl)
+  pl_path = strdup(path);
+  if (!pl_path)
     {
       DPRINTF(E_WARN, L_SCAN, "Out of memory for deferred playlist\n");
 
       return;
     }
 
-  memset(pl, 0, sizeof(struct deferred_pl));
+  /* Not using dispatch_group_async() on the scanner_grp as deferred playlists
+   * processing is triggered by scanner_grp being empty at the end of the bulk
+   * scan.
+   */
+  dispatch_retain(scanner_grp);
+  dispatch_async(deferred_pl_sq,
+		 ^{
+		   int ret;
 
-  pl->path = strdup(path);
-  if (!pl->path)
-    {
-      DPRINTF(E_WARN, L_SCAN, "Out of memory for deferred playlist\n");
+		   if (stop_scan)
+		     {
+		       free(pl_path);
+		       return;
+		     }
 
-      free(pl);
-      return;
-    }
+		   /* In case deinit() happens after the bulk scan */
+		   dispatch_group_enter(scanner_grp);
 
-  pl->next = playlists;
-  playlists = pl;
+		   ret = db_pool_get();
+		   if (ret < 0)
+		     {
+		       DPRINTF(E_LOG, L_SCAN, "Could not acquire database connection; skipping playlist %s\n", pl_path);
+
+		       free(pl_path);
+		       return;
+		     }
+
+		   process_playlist(pl_path);
+
+		   free(pl_path);
+		   db_pool_release();
+
+		   dispatch_group_leave(scanner_grp);
+		   dispatch_release(scanner_grp);
+		 });
 
   DPRINTF(E_INFO, L_SCAN, "Deferred playlist %s\n", path);
 }
 
-/* Thread: scan (bulk only) */
-static void
-process_deferred_playlists(void)
-{
-  struct deferred_pl *pl;
-
-  while ((pl = playlists))
-    {
-      playlists = pl->next;
-
-      process_playlist(pl->path);
-
-      free(pl->path);
-      free(pl);
-
-      /* Run the event loop */
-      event_base_loop(evbase_scan, EVLOOP_ONCE | EVLOOP_NONBLOCK);
-
-      if (scan_exit)
-	return;
-    }
-}
-
-/* Thread: scan */
+/* Queue: global */
 static void
 process_file(char *file, time_t mtime, off_t size, int compilation, int flags)
 {
@@ -508,7 +491,7 @@ process_file(char *file, time_t mtime, off_t size, int compilation, int flags)
 }
 
 
-/* Thread: scan */
+/* Queue: global */
 static int
 check_compilation(char *path)
 {
@@ -528,11 +511,13 @@ check_compilation(char *path)
   return 0;
 }
 
-/* Thread: scan */
+static void
+process_directory_async(char *path, int flags);
+
+/* Queue: global */
 static void
 process_directory(char *path, int flags)
 {
-  struct stacked_dir *bulkstack;
   DIR *dirp;
   struct dirent buf;
   struct dirent *de;
@@ -545,24 +530,6 @@ process_directory(char *path, int flags)
 #endif
   int compilation;
   int ret;
-
-  if (flags & F_SCAN_BULK)
-    {
-      /* Save our directory stack so it won't get handled inside
-       * the event loop - not its business, we're in bulk mode here.
-       */
-      bulkstack = dirstack;
-      dirstack = NULL;
-
-      /* Run the event loop */
-      event_base_loop(evbase_scan, EVLOOP_ONCE | EVLOOP_NONBLOCK);
-
-      /* Restore our directory stack */
-      dirstack = bulkstack;
-
-      if (scan_exit)
-	return;
-    }
 
   DPRINTF(E_DBG, L_SCAN, "Processing directory %s (flags = 0x%x)\n", path, flags);
 
@@ -579,6 +546,9 @@ process_directory(char *path, int flags)
 
   for (;;)
     {
+      if (stop_scan)
+	break;
+
       ret = readdir_r(dirp, &buf, &de);
       if (ret != 0)
 	{
@@ -641,18 +611,21 @@ process_directory(char *path, int flags)
       if (S_ISREG(sb.st_mode))
 	process_file(entry, sb.st_mtime, sb.st_size, compilation, flags);
       else if (S_ISDIR(sb.st_mode))
-	push_dir(&dirstack, entry);
+	process_directory_async(entry, flags);
       else
 	DPRINTF(E_LOG, L_SCAN, "Skipping %s, not a directory, symlink nor regular file\n", entry);
     }
 
   closedir(dirp);
 
+  if (stop_scan)
+    return;
+
   memset(&wi, 0, sizeof(struct watch_info));
 
 #if defined(__linux__)
   /* Add inotify watch */
-  wi.wd = inotify_add_watch(inofd, path, IN_CREATE | IN_DELETE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVE | IN_DELETE | IN_MOVE_SELF);
+  wi.wd = inotify_add_watch(ino_fd, path, IN_CREATE | IN_DELETE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVE | IN_DELETE | IN_MOVE_SELF);
   if (wi.wd < 0)
     {
       DPRINTF(E_WARN, L_SCAN, "Could not create inotify watch for %s: %s\n", path, strerror(errno));
@@ -682,7 +655,7 @@ process_directory(char *path, int flags)
   /* Add kevent */
   EV_SET(&kev, wi.wd, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_DELETE | NOTE_WRITE | NOTE_RENAME, 0, NULL);
 
-  ret = kevent(inofd, &kev, 1, NULL, 0, NULL);
+  ret = kevent(ino_fd, &kev, 1, NULL, 0, NULL);
   if (ret < 0)
     {
       DPRINTF(E_WARN, L_SCAN, "Could not add kevent for %s: %s\n", path, strerror(errno));
@@ -698,30 +671,64 @@ process_directory(char *path, int flags)
 #endif
 }
 
-/* Thread: scan */
+/* Queue: global */
 static void
-process_directories(char *root, int flags)
+process_directory_async(char *path, int flags)
 {
-  char *path;
+  char *my_path;
 
-  process_directory(root, flags);
-
-  if (scan_exit)
-    return;
-
-  while ((path = pop_dir(&dirstack)))
+  if (stop_scan)
     {
-      process_directory(path, flags);
+      if (flags & F_SCAN_NODUP)
+	free(path);
 
-      free(path);
-
-      if (scan_exit)
-	return;
+      return;
     }
+
+  if (flags & F_SCAN_NODUP)
+    {
+      my_path = path;
+
+      flags &= ~F_SCAN_NODUP;
+    }
+  else
+    {
+      my_path = strdup(path);
+      if (!my_path)
+	{
+	  DPRINTF(E_LOG, L_SCAN, "Skipping %s, out of memory\n", path);
+
+	  return;
+	}
+    }
+
+  dispatch_group_async(scanner_grp, dispatch_get_current_queue(),
+		       ^{
+			 int ret;
+
+			 if (stop_scan)
+			   {
+			     free(my_path);
+			     return;
+			   }
+
+			 ret = db_pool_get();
+			 if (ret < 0)
+			   {
+			     DPRINTF(E_LOG, L_SCAN, "Could not acquire database connection; skipping %s\n", my_path);
+
+			     free(my_path);
+			     return;
+			   }
+
+			 process_directory(my_path, flags);
+
+			 free(my_path);
+			 db_pool_release();
+		       });
 }
 
-
-/* Thread: scan */
+/* Queue: global */
 static void
 bulk_scan(void)
 {
@@ -733,9 +740,6 @@ bulk_scan(void)
   int i;
 
   start = time(NULL);
-
-  playlists = NULL;
-  dirstack = NULL;
 
   lib = cfg_getsec(cfg, "library");
 
@@ -752,40 +756,67 @@ bulk_scan(void)
 	  continue;
 	}
 
-      process_directories(deref, F_SCAN_BULK);
-
-      free(deref);
-
-      if (scan_exit)
-	return;
+      process_directory_async(deref, F_SCAN_BULK | F_SCAN_NODUP);
     }
 
-  if (playlists)
-    process_deferred_playlists();
+  /* Wait for the scanner group to be empty, then queue db_purge_cruft()
+   * on the deferred playlists queue and resume that queue.
+   * In a nutshell: wait until initial bulk scan is done, then
+   * process deferred playlists, then purge the database.
+   */
+  dispatch_retain(scanner_grp);
+  dispatch_group_notify(scanner_grp, dispatch_get_current_queue(),
+			^{
+			  dispatch_async(deferred_pl_sq,
+					 ^{
+					   int ret;
 
-  if (scan_exit)
-    return;
+					   if (stop_scan)
+					     return;
 
-  if (dirstack)
-    DPRINTF(E_LOG, L_SCAN, "WARNING: unhandled leftover directories\n");
+					   /* In case deinit() happens after the bulk scan */
+					   dispatch_group_enter(scanner_grp);
 
-  DPRINTF(E_DBG, L_SCAN, "Purging old database content\n");
-  db_purge_cruft(start);
+					   ret = db_pool_get();
+					   if (ret < 0)
+					     {
+					       DPRINTF(E_LOG, L_SCAN, "Could not acquire database connection; DB purge aborted\n");
+
+					       return;
+					     }
+
+					   DPRINTF(E_DBG, L_SCAN, "Purging old database content\n");
+					   db_purge_cruft(start);
+
+					   db_hook_post_scan();
+
+					   db_pool_release();
+
+					   dispatch_group_leave(scanner_grp);
+					   dispatch_release(scanner_grp);
+					 });
+
+			  DPRINTF(E_DBG, L_SCAN, "Now processing deferred playlists from bulk scan\n");
+
+			  dispatch_resume(deferred_pl_sq);
+			  dispatch_release(deferred_pl_sq);
+			  deferred_pl_sq = NULL;
+			});
 }
 
 
-/* Thread: scan */
-static void *
-filescanner(void *arg)
+/* Queue: global */
+static void
+startup_task(void *arg)
 {
   int ret;
 
-  ret = db_perthread_init();
+  ret = db_pool_get();
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_SCAN, "Error: DB init failed\n");
+      DPRINTF(E_LOG, L_SCAN, "Startup failed: could not acquire database connection\n");
 
-      pthread_exit(NULL);
+      return;
     }
 
   ret = db_watch_clear();
@@ -793,7 +824,7 @@ filescanner(void *arg)
     {
       DPRINTF(E_LOG, L_SCAN, "Error: could not clear old watches from DB\n");
 
-      pthread_exit(NULL);
+      goto startup_fail;
     }
 
   ret = db_groups_clear();
@@ -801,7 +832,7 @@ filescanner(void *arg)
     {
       DPRINTF(E_LOG, L_SCAN, "Error: could not clear old groups from DB\n");
 
-      pthread_exit(NULL);
+      goto startup_fail;
     }
 
   /* Recompute all songalbumids, in case the SQLite DB got transferred
@@ -812,27 +843,15 @@ filescanner(void *arg)
 
   bulk_scan();
 
-  db_hook_post_scan();
-
-  if (!scan_exit)
-    {
-      /* Enable inotify */
-      event_add(&inoev, NULL);
-
-      event_base_dispatch(evbase_scan);
-    }
-
-  if (!scan_exit)
-    DPRINTF(E_FATAL, L_SCAN, "Scan event loop terminated ahead of time!\n");
-
-  db_perthread_deinit();
-
-  pthread_exit(NULL);
+ startup_fail:
+  db_pool_release();
 }
 
 
 #if defined(__linux__)
-/* Thread: scan */
+#define process_fs_events() inotify_fs_events()
+
+/* Queue: global */
 static void
 process_inotify_dir(struct watch_info *wi, char *path, struct inotify_event *ie)
 {
@@ -866,7 +885,7 @@ process_inotify_dir(struct watch_info *wi, char *path, struct inotify_event *ie)
 
 	  while ((db_watch_enum_fetchwd(&we, &rm_wd) == 0) && (rm_wd))
 	    {
-	      inotify_rm_watch(inofd, rm_wd);
+	      inotify_rm_watch(ino_fd, rm_wd);
 	    }
 
 	  db_watch_enum_end(&we);
@@ -886,7 +905,7 @@ process_inotify_dir(struct watch_info *wi, char *path, struct inotify_event *ie)
 	   * and we can't tell where it's going
 	   */
 
-	  inotify_rm_watch(inofd, ie->wd);
+	  inotify_rm_watch(ino_fd, ie->wd);
 	  db_watch_delete_bywd(ie->wd);
 
 	  memset(&we, 0, sizeof(struct watch_enum));
@@ -899,7 +918,7 @@ process_inotify_dir(struct watch_info *wi, char *path, struct inotify_event *ie)
 
 	  while ((db_watch_enum_fetchwd(&we, &rm_wd) == 0) && (rm_wd))
 	    {
-	      inotify_rm_watch(inofd, rm_wd);
+	      inotify_rm_watch(ino_fd, rm_wd);
 	    }
 
 	  db_watch_enum_end(&we);
@@ -935,15 +954,10 @@ process_inotify_dir(struct watch_info *wi, char *path, struct inotify_event *ie)
     }
 
   if (ie->mask & IN_CREATE)
-    {
-      process_directories(path, flags);
-
-      if (dirstack)
-	DPRINTF(E_LOG, L_SCAN, "WARNING: unhandled leftover directories\n");
-    }
+    process_directory_async(path, flags);
 }
 
-/* Thread: scan */
+/* Queue: global */
 static void
 process_inotify_file(struct watch_info *wi, char *path, struct inotify_event *ie)
 {
@@ -1032,9 +1046,9 @@ process_inotify_file(struct watch_info *wi, char *path, struct inotify_event *ie
     }
 }
 
-/* Thread: scan */
+/* Queue: global */
 static void
-inotify_cb(int fd, short event, void *arg)
+inotify_fs_events(void)
 {
   struct inotify_event *buf;
   struct inotify_event *ie;
@@ -1045,7 +1059,7 @@ inotify_cb(int fd, short event, void *arg)
   int ret;
 
   /* Determine the size of the inotify queue */
-  ret = ioctl(fd, FIONREAD, &qsize);
+  ret = ioctl(ino_fd, FIONREAD, &qsize);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_SCAN, "Could not determine inotify queue size: %s\n", strerror(errno));
@@ -1061,7 +1075,7 @@ inotify_cb(int fd, short event, void *arg)
       return;
     }
 
-  ret = read(fd, buf, qsize);
+  ret = read(ino_fd, buf, qsize);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_SCAN, "inotify read failed: %s\n", strerror(errno));
@@ -1139,16 +1153,16 @@ inotify_cb(int fd, short event, void *arg)
     }
 
   free(buf);
-
-  event_add(&inoev, NULL);
 }
 #endif /* __linux__ */
 
 
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-/* Thread: scan */
+#define process_fs_events() kqueue_fs_events()
+
+/* Queue: global */
 static void
-kqueue_cb(int fd, short event, void *arg)
+kqueue_fs_events(void)
 {
   struct kevent kev;
   struct timespec ts;
@@ -1179,7 +1193,7 @@ kqueue_cb(int fd, short event, void *arg)
    * deleted or changed. We don't get directory/file names when directories/files
    * are created/deleted/renamed in the directory, so we have to rescan.
    */
-  while (kevent(fd, NULL, 0, &kev, 1, &ts) > 0)
+  while (kevent(ino_fd, NULL, 0, &kev, 1, &ts) > 0)
     {
       /* This should not happen, and if it does, we'll end up in
        * an infinite loop.
@@ -1314,123 +1328,116 @@ kqueue_cb(int fd, short event, void *arg)
     }
 
   while ((path = pop_dir(&rescan)))
-    {
-      process_directories(path, 0);
-
-      free(path);
-
-      if (rescan)
-	DPRINTF(E_LOG, L_SCAN, "WARNING: unhandled leftover directories\n");
-    }
-
-  event_add(&inoev, NULL);
+    process_directory_async(path, F_SCAN_NODUP);
 }
 #endif /* __FreeBSD__ || __FreeBSD_kernel__ */
-
-
-/* Thread: scan */
-static void
-exit_cb(int fd, short event, void *arg)
-{
-  event_base_loopbreak(evbase_scan);
-
-  scan_exit = 1;
-}
 
 
 /* Thread: main */
 int
 filescanner_init(void)
 {
-  int ret;
+  dispatch_queue_t global_q;
 
-  scan_exit = 0;
+  stop_scan = 0;
 
-  evbase_scan = event_base_new();
-  if (!evbase_scan)
+  scanner_grp = dispatch_group_create();
+  if (!scanner_grp)
     {
-      DPRINTF(E_FATAL, L_SCAN, "Could not create an event base\n");
+      DPRINTF(E_FATAL, L_SCAN, "Could not create dispatch group\n");
 
       return -1;
     }
 
-#ifdef USE_EVENTFD
-  exit_efd = eventfd(0, EFD_CLOEXEC);
-  if (exit_efd < 0)
+  deferred_pl_sq = dispatch_queue_create("org.forked-daapd.deferred-pl", NULL);
+  if (!deferred_pl_sq)
     {
-      DPRINTF(E_FATAL, L_SCAN, "Could not create eventfd: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_SCAN, "Could not create dispatch queue for deferred playlists\n");
 
-      goto pipe_fail;
+      goto queue_fail;
     }
-#else
-# if defined(__linux__)
-  ret = pipe2(exit_pipe, O_CLOEXEC);
-# else
-  ret = pipe(exit_pipe);
-# endif
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_SCAN, "Could not create pipe: %s\n", strerror(errno));
 
-      goto pipe_fail;
-    }
-#endif /* USE_EVENTFD */
+  dispatch_suspend(deferred_pl_sq);
 
 #if defined(__linux__)
-  inofd = inotify_init1(IN_CLOEXEC);
-  if (inofd < 0)
+  ino_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+  if (ino_fd < 0)
     {
       DPRINTF(E_FATAL, L_SCAN, "Could not create inotify fd: %s\n", strerror(errno));
 
       goto ino_fail;
     }
-
-  event_set(&inoev, inofd, EV_READ, inotify_cb, NULL);
-
 #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 
-  inofd = kqueue();
-  if (inofd < 0)
+  ino_fd = kqueue();
+  if (ino_fd < 0)
     {
       DPRINTF(E_FATAL, L_SCAN, "Could not create kqueue: %s\n", strerror(errno));
 
       goto ino_fail;
     }
-
-  event_set(&inoev, inofd, EV_READ, kqueue_cb, NULL);
 #endif
 
-  event_base_set(evbase_scan, &inoev);
-
-#ifdef USE_EVENTFD
-  event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
-#else
-  event_set(&exitev, exit_pipe[0], EV_READ, exit_cb, NULL);
-#endif
-  event_base_set(evbase_scan, &exitev);
-  event_add(&exitev, NULL);
-
-  ret = pthread_create(&tid_scan, NULL, filescanner, NULL);
-  if (ret != 0)
+  global_q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+  if (!global_q)
     {
-      DPRINTF(E_FATAL, L_SCAN, "Could not spawn filescanner thread: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_SCAN, "Could not get global dispatch queue\n");
 
-      goto thread_fail;
+      goto source_fail;
     }
+
+  ino_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, ino_fd, 0, global_q);
+  if (!ino_src)
+    {
+      DPRINTF(E_FATAL, L_SCAN, "Could not create dispatch source for inotify\n");
+
+      goto source_fail;
+    }
+
+  dispatch_source_set_event_handler(ino_src,
+				    ^{
+				      int ret;
+
+				      dispatch_group_enter(scanner_grp);
+
+				      if (stop_scan)
+					{
+					  dispatch_group_leave(scanner_grp);
+					  return;
+					}
+
+				      ret = db_pool_get();
+				      if (ret < 0)
+					{
+					  DPRINTF(E_LOG, L_SCAN, "Could not acquire database connection; inotify event aborted\n");
+
+					  dispatch_group_leave(scanner_grp);
+					  return;
+					}
+
+				      process_fs_events();
+
+				      db_pool_release();
+				      dispatch_group_leave(scanner_grp);
+				    });
+
+  dispatch_source_set_cancel_handler(ino_src,
+				     ^{
+				       close(ino_fd);
+				     });
+
+  dispatch_resume(ino_src);
+
+  dispatch_group_async_f(scanner_grp, global_q, NULL, startup_task);
 
   return 0;
 
- thread_fail:
-  close(inofd);
+ source_fail:
+  close(ino_fd);
  ino_fail:
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-#endif
- pipe_fail:
-  event_base_free(evbase_scan);
+  dispatch_release(deferred_pl_sq);
+ queue_fail:
+  dispatch_release(scanner_grp);
 
   return -1;
 }
@@ -1439,44 +1446,20 @@ filescanner_init(void)
 void
 filescanner_deinit(void)
 {
-  int ret;
+  long ret;
 
-#ifdef USE_EVENTFD
-  ret = eventfd_write(exit_efd, 1);
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_SCAN, "Could not send exit event: %s\n", strerror(errno));
+  dispatch_source_cancel(ino_src);
+  dispatch_release(ino_src);
 
-      return;
-    }
-#else
-  int dummy = 42;
+  stop_scan = 1;
 
-  ret = write(exit_pipe[1], &dummy, sizeof(dummy));
-  if (ret != sizeof(dummy))
-    {
-      DPRINTF(E_FATAL, L_SCAN, "Could not write to exit fd: %s\n", strerror(errno));
+  DPRINTF(E_INFO, L_SCAN, "Waiting for filescanner jobs to finish...\n");
 
-      return;
-    }
-#endif
+  ret = dispatch_group_wait(scanner_grp, DISPATCH_TIME_FOREVER);
+  dispatch_release(scanner_grp);
 
-  ret = pthread_join(tid_scan, NULL);
   if (ret != 0)
-    {
-      DPRINTF(E_FATAL, L_SCAN, "Could not join filescanner thread: %s\n", strerror(errno));
+    DPRINTF(E_LOG, L_SCAN, "Error waiting for dispatch group\n");
 
-      return;
-    }
-
-  event_del(&inoev);
-
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-#endif
-  close(inofd);
-  event_base_free(evbase_scan);
+  /* deferred_pl_sq resumed & released after completion of the bulk scan */
 }
