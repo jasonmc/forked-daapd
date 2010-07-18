@@ -42,6 +42,8 @@ Libraries:
         /!\ Read below
  - libevent 1.4+
         from <http://www.monkey.org/~provos/libevent/>
+ - libtre
+        from <http://laurikari.net/tre/download/>
  - libavl
         /!\ Read below
  - MiniXML (aka mxml or libmxml)
