@@ -75,6 +75,7 @@ forked_daapd_SOURCES = main.c \
 	filescanner.c filescanner.h \
 	filescanner_ffmpeg.c filescanner_urlfile.c filescanner_m3u.c $(ITUNESSRC) \
 	mdns_avahi.c mdns.h \
+	network.c network.h \
 	remote_pairing.c remote_pairing.h \
 	evhttp/http.c evhttp/evhttp.h \
 	evhttp/http-internal.h evhttp/log.h \
