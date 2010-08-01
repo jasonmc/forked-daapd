@@ -69,6 +69,7 @@
 #include "db.h"
 #include "artwork.h"
 #include "dmap_common.h"
+#include "network.h"
 #include "raop.h"
 
 #ifndef MIN

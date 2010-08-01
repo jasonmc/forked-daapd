@@ -2,19 +2,9 @@
 #ifndef __RAOP_H__
 #define __RAOP_H__
 
-#include <netinet/in.h>
-
 #include <event.h>
 #include "evrtsp/evrtsp.h"
 
-
-union sockaddr_all
-{
-  struct sockaddr_in sin;
-  struct sockaddr_in6 sin6;
-  struct sockaddr sa;
-  struct sockaddr_storage ss;
-};
 
 enum raop_devtype {
   RAOP_DEV_APEX_80211G,
