@@ -66,6 +66,7 @@ struct db_pool_hdl {
   time_t last;
 
   struct db_pool_hdl *next;
+  struct db_pool_hdl *saved;
 };
 
 struct db_unlock {
@@ -3990,6 +3991,7 @@ db_pool_get_task(void *arg)
   ph->next = pool_used;
   pool_used = ph;
 
+  ph->saved = *my_pool_hdl;
   *my_pool_hdl = ph;
 }
 
@@ -3998,11 +4000,12 @@ db_pool_get(void)
 {
   struct db_pool_hdl *my_pool_hdl;
 
-  my_pool_hdl = NULL;
+  my_pool_hdl = pool_hdl;
 
   dispatch_sync_f(dbpool_sq, &my_pool_hdl, db_pool_get_task);
 
-  if (!my_pool_hdl)
+  /* Failed to get a new pool_hdl */
+  if (my_pool_hdl == pool_hdl)
     return -1;
 
   /* Set thread-local database handle */
@@ -4055,10 +4058,10 @@ db_pool_release(void)
   /* Copy thread-local database handle */
   my_pool_hdl = pool_hdl;
 
-  /* Reset thread-local database handle */
-  pool_hdl = NULL;
+  /* Restore thread-local database handle to previous value */
+  pool_hdl = my_pool_hdl->saved;
 
-  dispatch_sync_f(dbpool_sq, my_pool_hdl, db_pool_release_task);
+  dispatch_async_f(dbpool_sq, my_pool_hdl, db_pool_release_task);
 }
 
 static int
