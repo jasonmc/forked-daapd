@@ -281,7 +281,7 @@ static const char *sort_clause[] =
   };
 
 static char *db_path;
-static __thread sqlite3 *hdl;
+static __thread struct db_pool_hdl *pool_hdl;
 
 static dispatch_queue_t dbpool_sq;
 static dispatch_source_t pool_reclaim_timer;
@@ -496,7 +496,7 @@ db_wait_unlock(void)
   pthread_mutex_init(&u.lck, NULL);
   pthread_cond_init(&u.cond, NULL);
 
-  ret = sqlite3_unlock_notify(hdl, unlock_notify_cb, &u);
+  ret = sqlite3_unlock_notify(pool_hdl->hdl, unlock_notify_cb, &u);
   if (ret == SQLITE_OK)
     {
       pthread_mutex_lock(&u.lck);
@@ -538,7 +538,7 @@ db_blocking_prepare_v2(const char *query, int len, sqlite3_stmt **stmt, const ch
 {
   int ret;
 
-  while ((ret = sqlite3_prepare_v2(hdl, query, len, stmt, end)) == SQLITE_LOCKED)
+  while ((ret = sqlite3_prepare_v2(pool_hdl->hdl, query, len, stmt, end)) == SQLITE_LOCKED)
     {
       ret = db_wait_unlock();
       if (ret != SQLITE_OK)
@@ -567,7 +567,7 @@ db_exec(const char *query, char **errmsg)
       ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
       if (ret != SQLITE_OK)
 	{
-	  *errmsg = sqlite3_mprintf("prepare failed: %s", sqlite3_errmsg(hdl));
+	  *errmsg = sqlite3_mprintf("prepare failed: %s", sqlite3_errmsg(pool_hdl->hdl));
 	  return ret;
 	}
 
@@ -582,7 +582,7 @@ db_exec(const char *query, char **errmsg)
 
   if (ret != SQLITE_DONE)
     {
-      *errmsg = sqlite3_mprintf("step failed: %s", sqlite3_errmsg(hdl));
+      *errmsg = sqlite3_mprintf("step failed: %s", sqlite3_errmsg(pool_hdl->hdl));
       return ret;
     }
 
@@ -661,7 +661,7 @@ db_purge_cruft(time_t ref)
 	  sqlite3_free(errmsg);
 	}
       else
-	DPRINTF(E_DBG, L_DB, "Purged %d rows\n", sqlite3_changes(hdl));
+	DPRINTF(E_DBG, L_DB, "Purged %d rows\n", sqlite3_changes(pool_hdl->hdl));
     }
 
  purge_fail:
@@ -683,14 +683,14 @@ db_get_count(char *query)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
   ret = db_blocking_step(stmt);
   if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       return -1;
@@ -1252,7 +1252,7 @@ db_query_start(struct query_params *qp)
   ret = db_blocking_prepare_v2(query, -1, &qp->stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_free(query);
       return -1;
@@ -1306,7 +1306,7 @@ db_query_fetch_file(struct query_params *qp, struct db_media_file_info *dbmfi)
     }
   else if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -1362,7 +1362,7 @@ db_query_fetch_pl(struct query_params *qp, struct db_playlist_info *dbpli)
     }
   else if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -1441,7 +1441,7 @@ db_query_fetch_group(struct query_params *qp, struct db_group_info *dbgri)
     }
   else if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -1491,7 +1491,7 @@ db_query_fetch_string(struct query_params *qp, char **string)
     }
   else if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -1528,7 +1528,7 @@ db_query_fetch_string_sort(struct query_params *qp, char **string, char **sortst
     }
   else if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -1642,7 +1642,7 @@ db_file_path_byid(int id)
   ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_free(query);
       return NULL;
@@ -1654,7 +1654,7 @@ db_file_path_byid(int id)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       sqlite3_free(query);
@@ -1692,7 +1692,7 @@ db_file_id_byquery(char *query)
   ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       return 0;
     }
@@ -1703,7 +1703,7 @@ db_file_id_byquery(char *query)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       return 0;
@@ -1840,7 +1840,7 @@ db_file_stamp_bypath(char *path, time_t *stamp, int *id)
   ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_free(query);
       return;
@@ -1852,7 +1852,7 @@ db_file_stamp_bypath(char *path, time_t *stamp, int *id)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       sqlite3_free(query);
@@ -1903,7 +1903,7 @@ db_file_fetch_byquery(char *query)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       free(mfi);
       return NULL;
@@ -1916,7 +1916,7 @@ db_file_fetch_byquery(char *query)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       free(mfi);
@@ -2288,7 +2288,7 @@ db_file_enable_bycookie(uint32_t cookie, char *path)
 
   sqlite3_free(query);
 
-  return sqlite3_changes(hdl);
+  return sqlite3_changes(pool_hdl->hdl);
 
 #undef Q_TMPL
 }
@@ -2399,7 +2399,7 @@ db_pl_id_bypath(char *path, int *id)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_free(query);
       return -1;
@@ -2411,7 +2411,7 @@ db_pl_id_bypath(char *path, int *id)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       sqlite3_free(query);
@@ -2462,7 +2462,7 @@ db_pl_fetch_byquery(char *query)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       free(pli);
       return NULL;
@@ -2474,7 +2474,7 @@ db_pl_fetch_byquery(char *query)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       free(pli);
@@ -2678,7 +2678,7 @@ db_pl_add(char *title, char *path, int *id)
 
   sqlite3_free(query);
 
-  *id = (int)sqlite3_last_insert_rowid(hdl);
+  *id = (int)sqlite3_last_insert_rowid(pool_hdl->hdl);
   if (*id == 0)
     {
       DPRINTF(E_LOG, L_DB, "Successful insert but no last_insert_rowid!\n");
@@ -2932,7 +2932,7 @@ db_pl_enable_bycookie(uint32_t cookie, char *path)
 
   sqlite3_free(query);
 
-  return sqlite3_changes(hdl);
+  return sqlite3_changes(pool_hdl->hdl);
 
 #undef Q_TMPL
 }
@@ -2981,7 +2981,7 @@ db_group_type_byid(int id)
   ret = db_blocking_prepare_v2(query, strlen(query) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_free(query);
       return 0;
@@ -2993,7 +2993,7 @@ db_group_type_byid(int id)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "No results\n");
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       sqlite3_free(query);
@@ -3110,7 +3110,7 @@ db_pairing_fetch_byguid(struct pairing_info *pi)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -3120,7 +3120,7 @@ db_pairing_fetch_byguid(struct pairing_info *pi)
       if (ret == SQLITE_DONE)
 	DPRINTF(E_INFO, L_DB, "Pairing GUID %s not found\n", pi->guid);
       else
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       sqlite3_free(query);
@@ -3202,7 +3202,7 @@ db_speaker_get(uint64_t id, int *selected, int *volume)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       ret = -1;
       goto out;
@@ -3212,7 +3212,7 @@ db_speaker_get(uint64_t id, int *selected, int *volume)
   if (ret != SQLITE_ROW)
     {
       if (ret != SQLITE_DONE)
-	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+	DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
 
@@ -3461,7 +3461,7 @@ db_watch_get_bywd(struct watch_info *wi)
   ret = db_blocking_prepare_v2(query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -3688,7 +3688,7 @@ db_watch_enum_start(struct watch_enum *we)
   ret = db_blocking_prepare_v2(query, -1, &we->stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_free(query);
       return -1;
@@ -3733,7 +3733,7 @@ db_watch_enum_fetchwd(struct watch_enum *we, uint32_t *wd)
     }
   else if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));	
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return -1;
     }
 
@@ -3760,7 +3760,7 @@ db_xprofile(void *notused, const char *pquery, sqlite3_uint64 ptime)
       return;
 
   /* Disable profiling callback */
-  sqlite3_profile(hdl, NULL, NULL);
+  sqlite3_profile(pool_hdl->hdl, NULL, NULL);
 
   query = sqlite3_mprintf("EXPLAIN QUERY PLAN %s", pquery);
   if (!query)
@@ -3774,7 +3774,7 @@ db_xprofile(void *notused, const char *pquery, sqlite3_uint64 ptime)
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_DBG, L_DBPERF, "Query plan: Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_DBG, L_DBPERF, "Query plan: Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       goto out;
     }
@@ -3789,7 +3789,7 @@ db_xprofile(void *notused, const char *pquery, sqlite3_uint64 ptime)
     }
 
   if (ret != SQLITE_DONE)
-    DPRINTF(E_DBG, L_DBPERF, "Query plan: Could not step: %s\n", sqlite3_errmsg(hdl));
+    DPRINTF(E_DBG, L_DBPERF, "Query plan: Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
   DPRINTF(E_DBG, L_DBPERF, "---\n");
 
@@ -3797,7 +3797,7 @@ db_xprofile(void *notused, const char *pquery, sqlite3_uint64 ptime)
 
  out:
   /* Reenable profiling callback */
-  sqlite3_profile(hdl, db_xprofile, NULL);
+  sqlite3_profile(pool_hdl->hdl, db_xprofile, NULL);
 }
 #endif
 
@@ -3964,10 +3964,10 @@ static void
 db_pool_get_task(void *arg)
 {
   struct db_pool_hdl *ph;
-  sqlite3 **my_hdl;
+  struct db_pool_hdl **my_pool_hdl;
   int ret;
 
-  my_hdl = (sqlite3 **)arg;
+  my_pool_hdl = (struct db_pool_hdl **)arg;
 
   if (!pool_free)
     {
@@ -3990,23 +3990,23 @@ db_pool_get_task(void *arg)
   ph->next = pool_used;
   pool_used = ph;
 
-  *my_hdl = ph->hdl;
+  *my_pool_hdl = ph;
 }
 
 int
 db_pool_get(void)
 {
-  sqlite3 *my_hdl;
+  struct db_pool_hdl *my_pool_hdl;
 
-  my_hdl = NULL;
+  my_pool_hdl = NULL;
 
-  dispatch_sync_f(dbpool_sq, &my_hdl, db_pool_get_task);
+  dispatch_sync_f(dbpool_sq, &my_pool_hdl, db_pool_get_task);
 
-  if (!my_hdl)
+  if (!my_pool_hdl)
     return -1;
 
   /* Set thread-local database handle */
-  hdl = my_hdl;
+  pool_hdl = my_pool_hdl;
 
   return 0;
 }
@@ -4016,15 +4016,15 @@ db_pool_release_task(void *arg)
 {
   struct db_pool_hdl *ph;
   struct db_pool_hdl *ph_prev;
-  sqlite3 *my_hdl;
+  struct db_pool_hdl *my_pool_hdl;
 
-  my_hdl = (sqlite3 *)arg;
+  my_pool_hdl = (struct db_pool_hdl *)arg;
 
   ph_prev = NULL;
 
   for (ph = pool_used; ph; ph = ph->next)
     {
-      if (ph->hdl == my_hdl)
+      if (ph == my_pool_hdl)
 	break;
 
       ph_prev = ph;
@@ -4050,15 +4050,15 @@ db_pool_release_task(void *arg)
 void
 db_pool_release(void)
 {
-  sqlite3 *my_hdl;
+  struct db_pool_hdl *my_pool_hdl;
 
   /* Copy thread-local database handle */
-  my_hdl = hdl;
+  my_pool_hdl = pool_hdl;
 
   /* Reset thread-local database handle */
-  hdl = NULL;
+  pool_hdl = NULL;
 
-  dispatch_sync_f(dbpool_sq, my_hdl, db_pool_release_task);
+  dispatch_sync_f(dbpool_sq, my_pool_hdl, db_pool_release_task);
 }
 
 static int
@@ -4141,9 +4141,20 @@ db_pool_deinit(void)
 int
 db_perthread_init(void)
 {
-  hdl = db_conn_open();
-  if (!hdl)
+  pool_hdl = (struct db_pool_hdl *)malloc(sizeof(struct db_pool_hdl));
+  if (!pool_hdl)
     return -1;
+
+  memset(pool_hdl, 0, sizeof(struct db_pool_hdl));
+
+  pool_hdl->hdl = db_conn_open();
+  if (!pool_hdl->hdl)
+    {
+      free(pool_hdl);
+      pool_hdl = NULL;
+
+      return -1;
+    }
 
   return 0;
 }
@@ -4151,12 +4162,13 @@ db_perthread_init(void)
 void
 db_perthread_deinit(void)
 {
-  if (!hdl)
+  if (!pool_hdl)
     return;
 
-  db_conn_close(hdl);
+  db_conn_close(pool_hdl->hdl);
 
-  hdl = NULL;
+  free(pool_hdl);
+  pool_hdl = NULL;
 }
 
 
@@ -4415,7 +4427,7 @@ db_create_tables(void)
     {
       DPRINTF(E_DBG, L_DB, "DB init query: %s\n", db_init_queries[i].desc);
 
-      ret = sqlite3_exec(hdl, db_init_queries[i].query, NULL, NULL, &errmsg);
+      ret = sqlite3_exec(pool_hdl->hdl, db_init_queries[i].query, NULL, NULL, &errmsg);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_FATAL, L_DB, "DB init error: %s\n", errmsg);
@@ -4439,7 +4451,7 @@ db_generic_upgrade(const struct db_init_query *queries, int nqueries)
     {
       DPRINTF(E_DBG, L_DB, "DB upgrade query: %s\n", queries->desc);
 
-      ret = sqlite3_exec(hdl, queries->query, NULL, NULL, &errmsg);
+      ret = sqlite3_exec(pool_hdl->hdl, queries->query, NULL, NULL, &errmsg);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_FATAL, L_DB, "DB upgrade error: %s\n", errmsg);
@@ -4506,10 +4518,10 @@ db_upgrade_v11(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = sqlite3_prepare_v2(pool_hdl->hdl, query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       goto out_free_ids;
     }
@@ -4534,7 +4546,7 @@ db_upgrade_v11(void)
 
   if ((ret == 0) && (qret != SQLITE_DONE))
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       goto out_free_ids;
     }
@@ -4546,10 +4558,10 @@ db_upgrade_v11(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, NULL);
+  ret = sqlite3_prepare_v2(pool_hdl->hdl, query, -1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       goto out_free_ids;
     }
@@ -4557,7 +4569,7 @@ db_upgrade_v11(void)
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       goto out_free_ids;
@@ -4580,7 +4592,7 @@ db_upgrade_v11(void)
 
       DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-      ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+      ret = sqlite3_exec(pool_hdl->hdl, query, NULL, NULL, &errmsg);
       if (ret != SQLITE_OK)
 	DPRINTF(E_LOG, L_DB, "Error adding speaker: %s\n", errmsg);
 
@@ -4601,7 +4613,7 @@ db_upgrade_v11(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(pool_hdl->hdl, query, NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error adding speaker: %s\n", errmsg);
 
@@ -4614,7 +4626,7 @@ db_upgrade_v11(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
 
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(pool_hdl->hdl, query, NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     DPRINTF(E_LOG, L_DB, "Error adding speaker: %s\n", errmsg);
 
@@ -4779,10 +4791,10 @@ db_upgrade_v12(void)
   DPRINTF(E_LOG, L_DB, "Dumping old files table...\n");
 
   /* dump */
-  ret = sqlite3_prepare_v2(hdl, Q_DUMP, strlen(Q_DUMP) + 1, &stmt, NULL);
+  ret = sqlite3_prepare_v2(pool_hdl->hdl, Q_DUMP, strlen(Q_DUMP) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       ret = -1;
       goto out_fclose;
@@ -4806,7 +4818,7 @@ db_upgrade_v12(void)
 
   if (ret != SQLITE_DONE)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
 
@@ -4862,7 +4874,7 @@ db_upgrade_v12(void)
   /* Move old table out of the way */
   DPRINTF(E_LOG, L_DB, "Moving old files table out of the way...\n");
 
-  ret = sqlite3_exec(hdl, "ALTER TABLE files RENAME TO oldfilesv11;", NULL, NULL, &errmsg);
+  ret = sqlite3_exec(pool_hdl->hdl, "ALTER TABLE files RENAME TO oldfilesv11;", NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error renaming old files table: %s\n", errmsg);
@@ -4876,7 +4888,7 @@ db_upgrade_v12(void)
   /* Create new table */
   DPRINTF(E_LOG, L_DB, "Creating new files table...\n");
 
-  ret = sqlite3_exec(hdl, U_V12_NEW_FILES_TABLE, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(pool_hdl->hdl, U_V12_NEW_FILES_TABLE, NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error creating new files table: %s\n", errmsg);
@@ -4892,7 +4904,7 @@ db_upgrade_v12(void)
 
   if (dump)
     {
-      ret = sqlite3_exec(hdl, dump, NULL, NULL, &errmsg);
+      ret = sqlite3_exec(pool_hdl->hdl, dump, NULL, NULL, &errmsg);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_LOG, L_DB, "Error reloading files table data: %s\n", errmsg);
@@ -4907,7 +4919,7 @@ db_upgrade_v12(void)
   /* Delete old files table */
   DPRINTF(E_LOG, L_DB, "Deleting old files table...\n");
 
-  ret = sqlite3_exec(hdl, "DROP TABLE oldfilesv11;", NULL, NULL, &errmsg);
+  ret = sqlite3_exec(pool_hdl->hdl, "DROP TABLE oldfilesv11;", NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_DB, "Error dropping old files table: %s\n", errmsg);
@@ -5030,17 +5042,17 @@ db_check_version(void)
 
   DPRINTF(E_DBG, L_DB, "Running query '%s'\n", Q_VER);
 
-  ret = sqlite3_prepare_v2(hdl, Q_VER, strlen(Q_VER) + 1, &stmt, NULL);
+  ret = sqlite3_prepare_v2(pool_hdl->hdl, Q_VER, strlen(Q_VER) + 1, &stmt, NULL);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not prepare statement: %s\n", sqlite3_errmsg(pool_hdl->hdl));
       return 1;
     }
 
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_ROW)
     {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(pool_hdl->hdl));
 
       sqlite3_finalize(stmt);
       return -1;
@@ -5099,7 +5111,7 @@ db_check_version(void)
       /* What about some housekeeping work, eh? */
       DPRINTF(E_INFO, L_DB, "Now vacuuming database, this may take some time...\n");
 
-      ret = sqlite3_exec(hdl, Q_VACUUM, NULL, NULL, &errmsg);
+      ret = sqlite3_exec(pool_hdl->hdl, Q_VACUUM, NULL, NULL, &errmsg);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_LOG, L_DB, "Could not VACUUM database: %s\n", errmsg);
