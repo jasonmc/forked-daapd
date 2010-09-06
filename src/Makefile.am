@@ -77,7 +77,7 @@ forked_daapd_SOURCES = main.c \
 	mdns_avahi.c mdns.h \
 	network.c network.h \
 	remote_pairing.c remote_pairing.h \
-	evhttp/http.c evhttp/evhttp.h \
+	evhttp/evhttp.c evhttp/evhttp.h \
 	evhttp/http-internal.h evhttp/log.h \
 	$(FFURL_SRC) $(AVIO_SRC) \
 	httpd.c httpd.h \
