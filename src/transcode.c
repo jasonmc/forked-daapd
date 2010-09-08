@@ -39,7 +39,6 @@
 #endif
 
 #include <event.h>
-#include "evhttp/evhttp.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -47,6 +46,7 @@
 #include "logger.h"
 #include "conffile.h"
 #include "db.h"
+#include "http.h"
 #include "transcode.h"
 
 
@@ -504,7 +504,7 @@ transcode_cleanup(struct transcode_ctx *ctx)
 
 
 int
-transcode_needed(struct evkeyvalq *headers, char *file_codectype)
+transcode_needed(struct http_request *req, char *file_codectype)
 {
   const char *client_codecs;
   const char *user_agent;
@@ -549,10 +549,10 @@ transcode_needed(struct evkeyvalq *headers, char *file_codectype)
 	}
     }
 
-  client_codecs = evhttp_find_header(headers, "Accept-Codecs");
+  client_codecs = http_request_get_header(req, "Accept-Codecs");
   if (!client_codecs)
     {
-      user_agent = evhttp_find_header(headers, "User-Agent");
+      user_agent = http_request_get_header(req, "User-Agent");
       if (user_agent)
 	{
 	  DPRINTF(E_DBG, L_XCODE, "User-Agent: %s\n", user_agent);

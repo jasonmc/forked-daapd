@@ -2,7 +2,7 @@
 #ifndef __TRANSCODE_H__
 #define __TRANSCODE_H__
 
-#include "evhttp/evhttp.h"
+#include "http.h"
 
 struct transcode_ctx;
 
@@ -19,6 +19,6 @@ void
 transcode_cleanup(struct transcode_ctx *ctx);
 
 int
-transcode_needed(struct evkeyvalq *headers, char *file_codectype);
+transcode_needed(struct http_request *req, char *file_codectype);
 
 #endif /* !__TRANSCODE_H__ */
