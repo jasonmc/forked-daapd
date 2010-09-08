@@ -3,20 +3,32 @@
 #define __HTTPD_H__
 
 #include <event.h>
-#include "evhttp/evhttp.h"
+#include "http.h"
 
 
-void
-httpd_stream_file(struct evhttp_request *req, int id);
+struct httpd_hdl {
+  struct http_connection *c;
+  struct http_request *req;
+  struct http_response *r;
 
-void
-httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struct evbuffer *evbuf);
+  struct keyval *query;
+};
 
-char *
-httpd_fixup_uri(struct evhttp_request *req);
 
 int
-httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *realm);
+httpd_stream_file(struct http_connection *c, struct http_request *req, struct http_response *r, int id);
+
+int
+httpd_send_reply(struct http_connection *c, struct http_request *req, struct http_response *r, struct evbuffer *evbuf);
+
+int
+httpd_send_error(struct http_connection *c, struct http_response *r, int code, char *reason);
+
+char *
+httpd_fixup_uri(struct http_request *req);
+
+int
+httpd_basic_auth(struct http_connection *c, struct http_request *req, struct http_response *r, char *user, char *passwd, char *realm);
 
 int
 httpd_init(void);

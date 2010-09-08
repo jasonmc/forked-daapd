@@ -27,7 +27,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <errno.h>
-#include <pthread.h>
 #include <time.h>
 #include <sys/param.h>
 #include <sys/queue.h>
@@ -36,19 +35,17 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#if defined(HAVE_SYS_EVENTFD_H) && defined(HAVE_EVENTFD)
-# define USE_EVENTFD
-# include <sys/eventfd.h>
-#endif
-
 #include <zlib.h>
+
+#include <dispatch/dispatch.h>
 #include <event.h>
-#include "evhttp/evhttp.h"
 
 #include "logger.h"
 #include "db.h"
 #include "conffile.h"
 #include "misc.h"
+#include "network.h"
+#include "http.h"
 #include "httpd.h"
 #include "httpd_rsp.h"
 #include "httpd_daap.h"
@@ -84,10 +81,8 @@ struct content_type_map {
 };
 
 struct stream_ctx {
-  struct evhttp_request *req;
   uint8_t *buf;
   struct evbuffer *evbuf;
-  struct event ev;
   int id;
   int fd;
   off_t size;
@@ -113,29 +108,22 @@ static const struct content_type_map ext2ctype[] =
     { NULL, NULL }
   };
 
-struct event_base *evbase_httpd;
-
-#ifdef USE_EVENTFD
-static int exit_efd;
-#else
-static int exit_pipe[2];
-#endif
-static int httpd_exit;
-static struct event exitev;
-static struct evhttp *evhttpd;
-static pthread_t tid_httpd;
+static dispatch_group_t http_group;
+static struct http_server *http6;
+static struct http_server *http4;
 
 
 static void
-stream_end(struct stream_ctx *st, int failed)
+stream_chunk_free_cb(void *data)
 {
-  if (st->req->evcon)
-    evhttp_connection_set_closecb(st->req->evcon, NULL, NULL);
+  struct stream_ctx *st;
 
-  if (!failed)
-    evhttp_send_reply_end(st->req);
+  st = (struct stream_ctx *)data;
 
-  evbuffer_free(st->evbuf);
+  DPRINTF(E_LOG, L_HTTPD, "Connection closed; stopping streaming of file ID %d\n", st->id);
+
+  if (st->evbuf)
+    evbuffer_free(st->evbuf);
 
   if (st->xcode)
     transcode_cleanup(st->xcode);
@@ -151,54 +139,46 @@ stream_end(struct stream_ctx *st, int failed)
 static void
 stream_up_playcount(struct stream_ctx *st)
 {
+  int ret;
+
   if (!st->marked
       && (st->stream_size > ((st->size * 50) / 100))
       && (st->offset > ((st->size * 80) / 100)))
     {
+      ret = db_pool_get();
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_HTTPD, "Could not acquire database connection; cannot increase playcount\n");
+
+	  return;
+	}
+
       st->marked = 1;
       db_file_inc_playcount(st->id);
+
+      db_pool_release();
     }
 }
 
-static void
-stream_chunk_resched_cb(struct evhttp_connection *evcon, void *arg)
+static int
+stream_get_chunk_xcode(struct stream_ctx *st)
 {
-  struct stream_ctx *st;
-  struct timeval tv;
-  int ret;
-
-  st = (struct stream_ctx *)arg;
-
-  evutil_timerclear(&tv);
-  ret = event_add(&st->ev, &tv);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_HTTPD, "Could not re-add one-shot event for streaming\n");
-
-      stream_end(st, 0);
-    }
-}
-
-static void
-stream_chunk_xcode_cb(int fd, short event, void *arg)
-{
-  struct stream_ctx *st;
-  struct timeval tv;
   int xcoded;
   int ret;
 
-  st = (struct stream_ctx *)arg;
-
+ consume:
   xcoded = transcode(st->xcode, st->evbuf, STREAM_CHUNK_SIZE);
-  if (xcoded <= 0)
+  if (xcoded == 0)
     {
-      if (xcoded == 0)
-	DPRINTF(E_LOG, L_HTTPD, "Done streaming transcoded file id %d\n", st->id);
-      else
-	DPRINTF(E_LOG, L_HTTPD, "Transcoding error, file id %d\n", st->id);
+      DPRINTF(E_LOG, L_HTTPD, "Done streaming transcoded file id %d\n", st->id);
 
-      stream_end(st, 0);
-      return;
+      return 0;
+    }
+  else if (xcoded < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Transcoding error, file id %d\n", st->id);
+
+      return -1;
     }
 
   DPRINTF(E_DBG, L_HTTPD, "Got %d bytes from transcode; streaming file id %d\n", xcoded, st->id);
@@ -226,40 +206,19 @@ stream_chunk_xcode_cb(int fd, short event, void *arg)
   else
     ret = xcoded;
 
-  evhttp_send_reply_chunk_with_cb(st->req, st->evbuf, stream_chunk_resched_cb, st);
-
   st->offset += ret;
 
-  stream_up_playcount(st);
-
-  return;
-
- consume: /* reschedule immediately - consume up to start_offset */
-  evutil_timerclear(&tv);
-  ret = event_add(&st->ev, &tv);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_HTTPD, "Could not re-add one-shot event for streaming (xcode)\n");
-
-      stream_end(st, 0);
-      return;
-    }
+  return 0;
 }
 
-static void
-stream_chunk_raw_cb(int fd, short event, void *arg)
+static int
+stream_get_chunk_raw(struct stream_ctx *st)
 {
-  struct stream_ctx *st;
   size_t chunk_size;
   int ret;
 
-  st = (struct stream_ctx *)arg;
-
   if (st->end_offset && (st->offset > st->end_offset))
-    {
-      stream_end(st, 0);
-      return;
-    }
+    return 0;
 
   if (st->end_offset && ((st->offset + STREAM_CHUNK_SIZE) > (st->end_offset + 1)))
     chunk_size = st->end_offset + 1 - st->offset;
@@ -267,53 +226,79 @@ stream_chunk_raw_cb(int fd, short event, void *arg)
     chunk_size = STREAM_CHUNK_SIZE;  
 
   ret = read(st->fd, st->buf, chunk_size);
-  if (ret <= 0)
+  if (ret == 0)
     {
-      if (ret == 0)
-	DPRINTF(E_LOG, L_HTTPD, "Done streaming file id %d\n", st->id);
-      else
-	DPRINTF(E_LOG, L_HTTPD, "Streaming error, file id %d\n", st->id);
+      DPRINTF(E_LOG, L_HTTPD, "Done streaming file id %d\n", st->id);
 
-      stream_end(st, 0);
-      return;
+      return 0;
+    }
+  else if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Streaming error, file id %d\n", st->id);
+
+      return -1;
     }
 
   DPRINTF(E_DBG, L_HTTPD, "Read %d bytes; streaming file id %d\n", ret, st->id);
 
-  evbuffer_add(st->evbuf, st->buf, ret);
-
-  evhttp_send_reply_chunk_with_cb(st->req, st->evbuf, stream_chunk_resched_cb, st);
-
   st->offset += ret;
 
-  stream_up_playcount(st);
+  ret = evbuffer_add(st->evbuf, st->buf, ret);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Out of memory for raw streaming evbuffer\n");
+
+      return -1;
+    }
+
+  return 0;
 }
 
-static void
-stream_fail_cb(struct evhttp_connection *evcon, void *arg)
+static struct evbuffer *
+stream_chunk_cb(struct http_connection *c, struct http_response *r, void *data)
 {
   struct stream_ctx *st;
+  struct evbuffer *evbuf;
+  int ret;
 
-  st = (struct stream_ctx *)arg;
+  st = (struct stream_ctx *)data;
 
-  DPRINTF(E_LOG, L_HTTPD, "Connection failed; stopping streaming of file ID %d\n", st->id);
+  if (st->xcode)
+    ret = stream_get_chunk_xcode(st);
+  else
+    ret = stream_get_chunk_raw(st);
 
-  /* Stop streaming */
-  event_del(&st->ev);
+  if (ret < 0)
+    return NULL;
 
-  stream_end(st, 1);
+  if (EVBUFFER_LENGTH(st->evbuf) == 0)
+    {
+      ret = http_server_response_end_chunked(c, r);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_HTTPD, "Failed to terminate chunked response properly!\n");
+
+	  stream_chunk_free_cb(st);
+	  return NULL;
+	}
+
+      /* Buffer will be freed by the server */
+      evbuf = st->evbuf;
+      st->evbuf = NULL;
+      return evbuf;
+    }
+
+  stream_up_playcount(st);
+
+  return st->evbuf;
 }
 
-
-/* Thread: httpd */
-void
-httpd_stream_file(struct evhttp_request *req, int id)
+int
+httpd_stream_file(struct http_connection *c, struct http_request *req, struct http_response *r, int id)
 {
+  struct stat sb;
   struct media_file_info *mfi;
   struct stream_ctx *st;
-  void (*stream_cb)(int fd, short event, void *arg);
-  struct stat sb;
-  struct timeval tv;
   const char *param;
   const char *param_end;
   char buf[64];
@@ -325,7 +310,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
 
   offset = 0;
   end_offset = 0;
-  param = evhttp_find_header(req->input_headers, "Range");
+  param = http_request_get_header(req, "Range");
   if (param)
     {
       DPRINTF(E_DBG, L_HTTPD, "Found Range header: %s\n", param);
@@ -359,19 +344,18 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	}
     }
 
+  /* Caller must have obtained a database connection from the pool */
   mfi = db_file_fetch_byid(id);
   if (!mfi)
     {
       DPRINTF(E_LOG, L_HTTPD, "Item %d not found\n", id);
 
-      evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-      return;
+      return http_server_error_run(c, r, HTTP_NOT_FOUND, "Not Found");
     }
 
   if (mfi->data_kind != 0)
     {
-      evhttp_send_error(req, 500, "Cannot stream radio station");
-
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Cannot stream radio station");
       goto out_free_mfi;
     }
 
@@ -380,33 +364,29 @@ httpd_stream_file(struct evhttp_request *req, int id)
     {
       DPRINTF(E_LOG, L_HTTPD, "Out of memory for struct stream_ctx\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
       goto out_free_mfi;
     }
   memset(st, 0, sizeof(struct stream_ctx));
   st->fd = -1;
 
-  transcode = transcode_needed(req->input_headers, mfi->codectype);
+  transcode = transcode_needed(req, mfi->codectype);
 
   if (transcode)
     {
       DPRINTF(E_INFO, L_HTTPD, "Preparing to transcode %s\n", mfi->path);
-
-      stream_cb = stream_chunk_xcode_cb;
 
       st->xcode = transcode_setup(mfi, &st->size, 1);
       if (!st->xcode)
 	{
 	  DPRINTF(E_WARN, L_HTTPD, "Transcoding setup failed, aborting streaming\n");
 
-	  evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
+	  ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 	  goto out_free_st;
 	}
 
-      if (!evhttp_find_header(req->output_headers, "Content-Type"))
-	evhttp_add_header(req->output_headers, "Content-Type", "audio/wav");
+      if (!http_response_get_header(r, "Content-Type"))
+	http_response_add_header(r, "Content-Type", "audio/wav");
     }
   else
     {
@@ -418,20 +398,16 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Out of memory for raw streaming buffer\n");
 
-	  evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
+	  ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 	  goto out_free_st;
 	}
-
-      stream_cb = stream_chunk_raw_cb;
 
       st->fd = open(mfi->path, O_RDONLY);
       if (st->fd < 0)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Could not open %s: %s\n", mfi->path, strerror(errno));
 
-	  evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
+	  ret = http_server_error_run(c, r, HTTP_NOT_FOUND, "Not Found");
 	  goto out_cleanup;
 	}
 
@@ -440,8 +416,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Could not stat() %s: %s\n", mfi->path, strerror(errno));
 
-	  evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
+	  ret = http_server_error_run(c, r, HTTP_NOT_FOUND, "Not Found");
 	  goto out_cleanup;
 	}
       st->size = sb.st_size;
@@ -451,8 +426,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Could not seek into %s: %s\n", mfi->path, strerror(errno));
 
-	  evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-
+	  ret = http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
 	  goto out_cleanup;
 	}
       st->offset = offset;
@@ -470,21 +444,21 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	    DPRINTF(E_LOG, L_HTTPD, "Content-Type too large for buffer, dropping\n");
 	  else
 	    {
-	      evhttp_remove_header(req->output_headers, "Content-Type");
-	      evhttp_add_header(req->output_headers, "Content-Type", buf);
+	      http_response_remove_header(r, "Content-Type");
+	      http_response_add_header(r, "Content-Type", buf);
 	    }
 	}
       /* If no Content-Type has been set and we're streaming audio, add a proper
        * Content-Type for the file we're streaming. Remember DAAP streams audio
        * with application/x-dmap-tagged as the Content-Type (ugh!).
        */
-      else if (!evhttp_find_header(req->output_headers, "Content-Type") && mfi->type)
+      else if (!http_response_get_header(r, "Content-Type") && mfi->type)
 	{
 	  ret = snprintf(buf, sizeof(buf), "audio/%s", mfi->type);
 	  if ((ret < 0) || (ret >= sizeof(buf)))
 	    DPRINTF(E_LOG, L_HTTPD, "Content-Type too large for buffer, dropping\n");
 	  else
-	    evhttp_add_header(req->output_headers, "Content-Type", buf);
+	    http_response_add_header(r, "Content-Type", buf);
 	}
     }
 
@@ -493,10 +467,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not allocate an evbuffer for streaming\n");
 
-      evhttp_clear_headers(req->output_headers);
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
-      goto out_cleanup;
+      goto out_error;
     }
 
   ret = evbuffer_expand(st->evbuf, STREAM_CHUNK_SIZE);
@@ -504,30 +475,12 @@ httpd_stream_file(struct evhttp_request *req, int id)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not expand evbuffer for streaming\n");
 
-      evhttp_clear_headers(req->output_headers);
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
-      goto out_cleanup;
-    }
-
-  evutil_timerclear(&tv);
-  event_set(&st->ev, -1, EV_TIMEOUT, stream_cb, st);
-  event_base_set(evbase_httpd, &st->ev);
-  ret = event_add(&st->ev, &tv);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_HTTPD, "Could not add one-shot event for streaming\n");
-
-      evhttp_clear_headers(req->output_headers);
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
-      goto out_cleanup;
+      goto out_error;
     }
 
   st->id = mfi->id;
   st->start_offset = offset;
   st->stream_size = st->size;
-  st->req = req;
 
   if ((offset == 0) && (end_offset == 0))
     {
@@ -541,10 +494,10 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	  if ((ret < 0) || (ret >= sizeof(buf)))
 	    DPRINTF(E_LOG, L_HTTPD, "Content-Length too large for buffer, dropping\n");
 	  else
-	    evhttp_add_header(req->output_headers, "Content-Length", buf);
+	    http_response_add_header(r, "Content-Length", buf);
 	}
 
-      evhttp_send_reply_start(req, HTTP_OK, "OK");
+      ret = http_response_set_status(r, HTTP_OK, "OK");
     }
   else
     {
@@ -560,15 +513,23 @@ httpd_stream_file(struct evhttp_request *req, int id)
       if ((ret < 0) || (ret >= sizeof(buf)))
 	DPRINTF(E_LOG, L_HTTPD, "Content-Range too large for buffer, dropping\n");
       else
-	evhttp_add_header(req->output_headers, "Content-Range", buf);
+	http_response_add_header(r, "Content-Range", buf);
 
       ret = snprintf(buf, sizeof(buf), "%" PRIi64, ((end_offset) ? end_offset + 1 : (int64_t)st->size) - offset);
       if ((ret < 0) || (ret >= sizeof(buf)))
 	DPRINTF(E_LOG, L_HTTPD, "Content-Length too large for buffer, dropping\n");
       else
-	evhttp_add_header(req->output_headers, "Content-Length", buf);
+	http_response_add_header(r, "Content-Length", buf);
 
-      evhttp_send_reply_start(req, 206, "Partial Content");
+      ret = http_response_set_status(r, HTTP_PARTIAL_CONTENT, "Partial Content");
+    }
+
+  /* http_response_set_status() retval */
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Could not set status on streaming response\n");
+
+      goto out_error;
     }
 
 #ifdef HAVE_POSIX_FADVISE
@@ -581,13 +542,49 @@ httpd_stream_file(struct evhttp_request *req, int id)
     }
 #endif
 
-  evhttp_connection_set_closecb(req->evcon, stream_fail_cb, st);
+  /* Get first chunk */
+  if (transcode)
+    ret = stream_get_chunk_xcode(st);
+  else
+    ret = stream_get_chunk_raw(st);
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Could not obtain first chunk for streaming\n");
+
+      goto out_error;
+    }
+
+  /* Empty response */
+  if (EVBUFFER_LENGTH(st->evbuf) == 0)
+    {
+      DPRINTF(E_INFO, L_HTTPD, "Empty streaming response\n");
+
+      ret = http_server_response_run(c, r);
+      if (ret < 0)
+	goto out_error;
+
+      /* Nothing more to do */
+      goto out_cleanup;
+    }
+
+  /* Start streaming */
+  ret = http_server_response_run_chunked(c, r, st->evbuf, stream_chunk_cb, stream_chunk_free_cb, st);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Could not start chunked response for streaming\n");
+
+      goto out_error;
+    }
 
   DPRINTF(E_INFO, L_HTTPD, "Kicking off streaming for %s\n", mfi->path);
 
   free_mfi(mfi, 0);
 
-  return;
+  return 0;
+
+ out_error:
+  ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 
  out_cleanup:
   if (st->evbuf)
@@ -602,11 +599,12 @@ httpd_stream_file(struct evhttp_request *req, int id)
   free(st);
  out_free_mfi:
   free_mfi(mfi, 0);
+
+  return ret;
 }
 
-/* Thread: httpd */
-void
-httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struct evbuffer *evbuf)
+int
+httpd_send_reply(struct http_connection *c, struct http_request *req, struct http_response *r, struct evbuffer *evbuf)
 {
   unsigned char outbuf[128 * 1024];
   z_stream strm;
@@ -623,7 +621,7 @@ httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struc
       goto no_gzip;
     }
 
-  param = evhttp_find_header(req->input_headers, "Accept-Encoding");
+  param = http_request_get_header(req, "Accept-Encoding");
   if (!param)
     {
       DPRINTF(E_DBG, L_HTTPD, "Not gzipping; no Accept-Encoding header\n");
@@ -704,34 +702,47 @@ httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struc
 
   deflateEnd(&strm);
 
-  evhttp_add_header(req->output_headers, "Content-Encoding", "gzip");
-  evhttp_send_reply(req, code, reason, gzbuf);
+  ret = http_response_add_header(r, "Content-Encoding", "gzip");
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Out of memory for Content-Encoding: gzip header, not gzipping\n");
 
-  evbuffer_free(gzbuf);
+      evbuffer_free(gzbuf);
+      goto no_gzip;
+    }
 
-  /* Drain original buffer, as would be after evhttp_send_reply() */
-  evbuffer_drain(evbuf, EVBUFFER_LENGTH(evbuf));
+  http_response_set_body(r, gzbuf);
+  evbuffer_free(evbuf);
 
-  return;
+  ret = http_server_response_run(c, r);
+  if (ret < 0)
+    return http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+  return 0;
 
  out_fail_gz:
   deflateEnd(&strm);
  out_fail_init:
   evbuffer_free(gzbuf);
+
  no_gzip:
-  evhttp_send_reply(req, code, reason, evbuf);
+  http_response_set_body(r, evbuf);
+
+  ret = http_server_response_run(c, r);
+  if (ret < 0)
+    return http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+  return 0;
 }
 
-/* Thread: httpd */
 static int
 path_is_legal(char *path)
 {
   return strncmp(WEBFACE_ROOT, path, strlen(WEBFACE_ROOT));
 }
 
-/* Thread: httpd */
-static void
-redirect_to_index(struct evhttp_request *req, char *uri)
+static int
+redirect_to_index(struct http_connection *c, struct http_response *r, char *uri)
 {
   char buf[256];
   int slashed;
@@ -744,20 +755,45 @@ redirect_to_index(struct evhttp_request *req, char *uri)
     {
       DPRINTF(E_LOG, L_HTTPD, "Redirection URL exceeds buffer length\n");
 
-      evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-      return;
+      return http_server_error_run(c, r, HTTP_NOT_FOUND, "Not Found");
     }
 
-  evhttp_add_header(req->output_headers, "Location", buf);
-  evhttp_send_reply(req, HTTP_MOVETEMP, "Moved", NULL);
+  ret = http_response_add_header(r, "Location", buf);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Out of memory for Location header\n");
+
+      goto out_error;
+    }
+
+  ret = http_response_set_status(r, HTTP_MOVE_TEMP, "Moved");
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Out of memory for response reason\n");
+
+      goto out_error;
+    }
+
+  ret = http_server_response_run(c, r);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Failed to run redirect response\n");
+
+      goto out_error;
+    }
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-/* Thread: httpd */
-static void
-serve_file(struct evhttp_request *req, char *uri)
+static int
+serve_file(struct http_connection *c, struct http_request *req, struct http_response *r, char *uri)
 {
-  char *ext;
   char path[PATH_MAX];
+  char remote_host[NCONN_ADDRSTRLEN];
+  char *ext;
   char *deref;
   char *ctype;
   char *passwd;
@@ -773,21 +809,32 @@ serve_file(struct evhttp_request *req, char *uri)
     {
       DPRINTF(E_DBG, L_HTTPD, "Checking web interface authentication\n");
 
-      ret = httpd_basic_auth(req, "admin", passwd, PACKAGE " web interface");
-      if (ret != 0)
-	return;
+      ret = httpd_basic_auth(c, req, r, "admin", passwd, PACKAGE " web interface");
+      switch (ret)
+	{
+	  case HTTP_OK:
+	    DPRINTF(E_DBG, L_HTTPD, "Authentication successful\n");
+	    break;
 
-      DPRINTF(E_DBG, L_HTTPD, "Authentication successful\n");
+	  case -1:
+	    /* Kill connection */
+	    return -1;
+
+	  default:
+	    /* HTTP_UNAUTHORIZED or HTTP_INTERNAL_ERROR on error */
+	    return 0;
+	}
     }
   else
     {
-      if ((strcmp(req->remote_host, "::1") != 0)
-	  && (strcmp(req->remote_host, "127.0.0.1") != 0))
+      remote_host[0] = '\0';
+      http_connection_get_remote_addr(c, remote_host);
+      if ((strcmp(remote_host, "::1") != 0) &&
+	  (strcmp(remote_host, "127.0.0.1") != 0))
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Remote web interface request denied; no password set\n");
 
-	  evhttp_send_error(req, 403, "Forbidden");
-	  return;
+	  return http_server_error_run(c, r, HTTP_FORBIDDEN, "Forbidden");
 	}
     }
 
@@ -796,9 +843,7 @@ serve_file(struct evhttp_request *req, char *uri)
     {
       DPRINTF(E_LOG, L_HTTPD, "Request exceeds PATH_MAX: %s\n", uri);
 
-      evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
-      return;
+      goto out_notfound;
     }
 
   ret = lstat(path, &sb);
@@ -806,17 +851,11 @@ serve_file(struct evhttp_request *req, char *uri)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not lstat() %s: %s\n", path, strerror(errno));
 
-      evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
-      return;
+      goto out_notfound;
     }
 
   if (S_ISDIR(sb.st_mode))
-    {
-      redirect_to_index(req, uri);
-
-      return;
-    }
+    return redirect_to_index(c, r, uri);
   else if (S_ISLNK(sb.st_mode))
     {
       deref = m_realpath(path);
@@ -824,19 +863,15 @@ serve_file(struct evhttp_request *req, char *uri)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Could not dereference %s: %s\n", path, strerror(errno));
 
-	  evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
-	  return;
+	  goto out_notfound;
 	}
 
       if (strlen(deref) + 1 > PATH_MAX)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Dereferenced path exceeds PATH_MAX: %s\n", path);
 
-	  evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
 	  free(deref);
-	  return;
+	  goto out_notfound;
 	}
 
       strcpy(path, deref);
@@ -847,24 +882,22 @@ serve_file(struct evhttp_request *req, char *uri)
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Could not stat() %s: %s\n", path, strerror(errno));
 
-	  evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-
-	  return;
+	  goto out_notfound;
 	}
 
       if (S_ISDIR(sb.st_mode))
-	{
-	  redirect_to_index(req, uri);
-
-	  return;
-	}
+	return redirect_to_index(c, r, uri);
     }
 
   if (path_is_legal(path) != 0)
-    {
-      evhttp_send_error(req, 403, "Forbidden");
+    return http_server_error_run(c, r, HTTP_FORBIDDEN, "Forbidden");
 
-      return;
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Could not open %s: %s\n", path, strerror(errno));
+
+      goto out_notfound;
     }
 
   evbuf = evbuffer_new();
@@ -872,17 +905,8 @@ serve_file(struct evhttp_request *req, char *uri)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not create evbuffer\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal error");
-      return;
-    }
-
-  fd = open(path, O_RDONLY);
-  if (fd < 0)
-    {
-      DPRINTF(E_LOG, L_HTTPD, "Could not open %s: %s\n", path, strerror(errno));
-
-      evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
-      return;
+      close(fd);
+      goto out_unavail;
     }
 
   /* FIXME: this is broken, if we ever need to serve files here,
@@ -894,9 +918,11 @@ serve_file(struct evhttp_request *req, char *uri)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not read file into evbuffer\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal error");
-      return;
+      evbuffer_free(evbuf);
+      goto out_unavail;
     }
+
+  http_response_set_body(r, evbuf);
 
   ctype = "application/octet-stream";
   ext = strrchr(path, '.');
@@ -912,28 +938,60 @@ serve_file(struct evhttp_request *req, char *uri)
 	}
     }
 
-  evhttp_add_header(req->output_headers, "Content-Type", ctype);
+  ret = http_response_add_header(r, "Content-Type", ctype);
+  if (ret < 0)
+    goto out_unavail;
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(r, HTTP_OK, "OK");
+  if (ret < 0)
+    goto out_unavail;
 
-  evbuffer_free(evbuf);
+  ret = http_server_response_run(c, r);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "Failed to serve file %s: could not run response\n", path);
+
+      goto out_unavail;
+    }
+
+  return 0;
+
+ out_unavail:
+  return http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+ out_notfound:
+  return http_server_error_run(c, r, HTTP_NOT_FOUND, "Not Found");
 }
 
-/* Thread: httpd */
 static void
-httpd_gen_cb(struct evhttp_request *req, void *arg)
+httpd_close_cb(struct http_server *srv, void *data)
+{
+  if (srv == http4)
+    {
+      DPRINTF(E_LOG, L_HTTPD, "v4 HTTP server failure!\n");
+      http4 = NULL;
+    }
+  else
+    {
+      DPRINTF(E_LOG, L_HTTPD, "v6 HTTP server failure!\n");
+      http6 = NULL;
+    }
+
+  http_server_free(srv);
+}
+
+/* Queue: c->queue (read queue) */
+static int
+httpd_cb(struct http_connection *c, struct http_request *req, struct http_response *r, void *data)
 {
   const char *req_uri;
   char *uri;
   char *ptr;
+  int ret;
 
-  req_uri = evhttp_request_uri(req);
+  req_uri = http_request_get_uri(req);
   if (!req_uri)
-    {
-      redirect_to_index(req, "/");
-
-      return;
-    }
+    return redirect_to_index(c, r, "/");
 
   uri = strdup(req_uri);
   ptr = strchr(uri, '?');
@@ -944,74 +1002,39 @@ httpd_gen_cb(struct evhttp_request *req, void *arg)
       *ptr = '\0';
     }
 
-  ptr = uri;
-  uri = evhttp_decode_uri(uri);
-  free(ptr);
+  http_decode_uri(uri, URI_DECODE_NORMAL);
 
   /* Dispatch protocol-specific URIs */
-  if (rsp_is_request(req, uri))
+  if (rsp_is_request(uri))
     {
-      rsp_request(req);
+      free(uri);
 
-      goto out;
+      return rsp_request(c, req, r);
     }
-  else if (daap_is_request(req, uri))
+  else if (daap_is_request(uri))
     {
-      daap_request(req);
+      free(uri);
 
-      goto out;
+      return daap_request(c, req, r);
     }
-  else if (dacp_is_request(req, uri))
+  else if (dacp_is_request(uri))
     {
-      dacp_request(req);
+      free(uri);
 
-      goto out;
+      return dacp_request(c, req, r);
     }
 
   DPRINTF(E_DBG, L_HTTPD, "HTTP request: %s\n", uri);
 
   /* Serve web interface files */
-  serve_file(req, uri);
+  ret = serve_file(c, req, r, uri);
 
- out:
   free(uri);
-}
-
-/* Thread: httpd */
-static void *
-httpd(void *arg)
-{
-  int ret;
-
-  ret = db_perthread_init();
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_HTTPD, "Error: DB init failed\n");
-
-      pthread_exit(NULL);
-    }
-
-  event_base_dispatch(evbase_httpd);
-
-  if (!httpd_exit)
-    DPRINTF(E_FATAL, L_HTTPD, "HTTPd event loop terminated ahead of time!\n");
-
-  db_perthread_deinit();
-
-  pthread_exit(NULL);
-}
-
-/* Thread: httpd */
-static void
-exit_cb(int fd, short event, void *arg)
-{
-  event_base_loopbreak(evbase_httpd);
-
-  httpd_exit = 1;
+  return ret;
 }
 
 char *
-httpd_fixup_uri(struct evhttp_request *req)
+httpd_fixup_uri(struct http_request *req)
 {
   const char *ua;
   const char *uri;
@@ -1021,7 +1044,7 @@ httpd_fixup_uri(struct evhttp_request *req)
   char *f;
   int len;
 
-  uri = evhttp_request_uri(req);
+  uri = http_request_get_uri(req);
   if (!uri)
     return NULL;
 
@@ -1030,7 +1053,7 @@ httpd_fixup_uri(struct evhttp_request *req)
   if (!q)
     return strdup(uri);
 
-  ua = evhttp_find_header(req->input_headers, "User-Agent");
+  ua = http_request_get_header(req, "User-Agent");
   if (!ua)
     return strdup(uri);
 
@@ -1092,7 +1115,7 @@ httpd_fixup_uri(struct evhttp_request *req)
 static const char *http_reply_401 = "<html><head><title>401 Unauthorized</title></head><body>Authorization required</body></html>";
 
 int
-httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *realm)
+httpd_basic_auth(struct http_connection *c, struct http_request *req, struct http_response *r, char *user, char *passwd, char *realm)
 {
   struct evbuffer *evbuf;
   char *header;
@@ -1102,7 +1125,7 @@ httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *rea
   int len;
   int ret;
 
-  auth = evhttp_find_header(req->input_headers, "Authorization");
+  auth = http_request_get_header(req, "Authorization");
   if (!auth)
     {
       DPRINTF(E_DBG, L_HTTPD, "No Authorization header\n");
@@ -1160,39 +1183,46 @@ httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *rea
 
   free(authuser);
 
-  return 0;
+  return HTTP_OK;
 
  need_auth:
   len = strlen(realm) + strlen("Basic realm=") + 3;
   header = (char *)malloc(len);
   if (!header)
-    {
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-      return -1;
-    }
+    goto out_error;
 
   ret = snprintf(header, len, "Basic realm=\"%s\"", realm);
   if ((ret < 0) || (ret >= len))
-    {
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-      return -1;
-    }
+    goto out_error;
+
+  ret = http_response_add_header(r, "WWW-Authenticate", header);
+  free(header);
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_response_set_status(r, HTTP_UNAUTHORIZED, "Unauthorized");
+  if (ret < 0)
+    goto out_error;
 
   evbuf = evbuffer_new();
   if (!evbuf)
-    {
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-      return -1;
-    }
+    goto out_error;
 
-  evhttp_add_header(req->output_headers, "WWW-Authenticate", header);
   evbuffer_add(evbuf, http_reply_401, strlen(http_reply_401));
-  evhttp_send_reply(req, 401, "Unauthorized", evbuf);
+  http_response_set_body(r, evbuf);
 
-  free(header);
-  evbuffer_free(evbuf);
+  ret = http_server_response_run(c, r);
+  if (ret < 0)
+    goto out_error;
 
-  return -1;
+  return HTTP_UNAUTHORIZED;
+
+ out_error:
+  ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+  if (ret < 0)
+    return -1;
+
+  return HTTP_INTERNAL_ERROR;
 }
 
 /* Thread: main */
@@ -1203,16 +1233,32 @@ httpd_init(void)
   int v6enabled;
   int ret;
 
-  httpd_exit = 0;
-
+  port = cfg_getint(cfg_getsec(cfg, "library"), "port");
   v6enabled = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6");
 
-  evbase_httpd = event_base_new();
-  if (!evbase_httpd)
+  http6 = NULL;
+
+  http_group = dispatch_group_create();
+  if (!http_group)
     {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not create an event base\n");
+      DPRINTF(E_FATAL, L_HTTPD, "Could not create dispatch group for HTTP servers\n");
 
       return -1;
+    }
+
+  http4 = http_server_new(L_HTTPD, http_group, "0.0.0.0", port, httpd_cb, httpd_close_cb);
+  if (!http4)
+    {
+      DPRINTF(E_FATAL, L_HTTPD, "Could not create v4 HTTP server\n");
+
+      goto http4_fail;
+    }
+
+  if (v6enabled)
+    {
+      http6 = http_server_new(L_HTTPD, http_group, "::", port, httpd_cb, httpd_close_cb);
+      if (!http6)
+	DPRINTF(E_WARN, L_HTTPD, "Could not create v6 HTTP server; that's OK\n");
     }
 
   ret = rsp_init();
@@ -1239,95 +1285,45 @@ httpd_init(void)
       goto dacp_fail;
     }
 
-#ifdef USE_EVENTFD
-  exit_efd = eventfd(0, EFD_CLOEXEC);
-  if (exit_efd < 0)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not create eventfd: %s\n", strerror(errno));
-
-      goto pipe_fail;
-    }
-#else
-# if defined(__linux__)
-  ret = pipe2(exit_pipe, O_CLOEXEC);
-# else
-  ret = pipe(exit_pipe);
-# endif
+  ret = http_server_start(http4);
   if (ret < 0)
     {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not create pipe: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_HTTPD, "Failed to start v4 HTTP server\n");
 
-      goto pipe_fail;
-    }
-#endif /* USE_EVENTFD */
-
-#ifdef USE_EVENTFD
-  event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
-#else
-  event_set(&exitev, exit_pipe[0], EV_READ, exit_cb, NULL);
-#endif
-  event_base_set(evbase_httpd, &exitev);
-  event_add(&exitev, NULL);
-
-  evhttpd = evhttp_new(evbase_httpd);
-  if (!evhttpd)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not create HTTP server\n");
-
-      goto evhttp_fail;
+      goto start_fail;
     }
 
-  port = cfg_getint(cfg_getsec(cfg, "library"), "port");
+  if (!http6)
+    return 0;
 
-  /* We are binding v6 and v4 separately, and we allow v6 to fail
-   * as IPv6 might not be supported on the system.
-   * We still warn about the failure, in case there's another issue.
-   */
-  ret = evhttp_bind_socket(evhttpd, "0.0.0.0", port);
+  ret = http_server_start(http6);
   if (ret < 0)
     {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not bind INADDR_ANY:%d\n", port);
+      DPRINTF(E_WARN, L_HTTPD, "Failed to start v6 HTTP server; that's OK\n");
 
-      goto bind_fail;
-    }
-
-  if (v6enabled)
-    {
-      ret = evhttp_bind_socket(evhttpd, "::", port);
-      if (ret < 0)
-	DPRINTF(E_WARN, L_HTTPD, "Could not bind IN6ADDR_ANY:%d (that's OK)\n", port);
-    }
-
-  evhttp_set_gencb(evhttpd, httpd_gen_cb, NULL);
-
-  ret = pthread_create(&tid_httpd, NULL, httpd, NULL);
-  if (ret != 0)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not spawn HTTPd thread: %s\n", strerror(errno));
-
-      goto thread_fail;
+      http_server_free(http6);
+      http6 = NULL;
     }
 
   return 0;
 
- thread_fail:
- bind_fail:
-  evhttp_free(evhttpd);
- evhttp_fail:
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-#endif
- pipe_fail:
+ start_fail:
   dacp_deinit();
  dacp_fail:
   daap_deinit();
  daap_fail:
   rsp_deinit();
  rsp_fail:
-  event_base_free(evbase_httpd);
+  if (http6)
+    http_server_free(http6);
+  http_server_free(http4);
+
+  /* Wait for shutdown completion for both servers */
+  ret = dispatch_group_wait(http_group, DISPATCH_TIME_FOREVER);
+  if (ret != 0)
+    DPRINTF(E_LOG, L_HTTPD, "Error waiting for dispatch group\n");
+ http4_fail:
+  dispatch_release(http_group);
 
   return -1;
 }
@@ -1338,44 +1334,21 @@ httpd_deinit(void)
 {
   int ret;
 
-#ifdef USE_EVENTFD
-  ret = eventfd_write(exit_efd, 1);
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not send exit event: %s\n", strerror(errno));
+  if (http6)
+    http_server_free(http6);
 
-      return;
-    }
-#else
-  int dummy = 42;
+  if (http4)
+    http_server_free(http4);
 
-  ret = write(exit_pipe[1], &dummy, sizeof(dummy));
-  if (ret != sizeof(dummy))
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not write to exit fd: %s\n", strerror(errno));
+  DPRINTF(E_INFO, L_HTTPD, "Waiting for HTTP servers to shut down...\n");
 
-      return;
-    }
-#endif
+  ret = dispatch_group_wait(http_group, DISPATCH_TIME_FOREVER);
+  dispatch_release(http_group);
 
-  ret = pthread_join(tid_httpd, NULL);
   if (ret != 0)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not join HTTPd thread: %s\n", strerror(errno));
-
-      return;
-    }
+    DPRINTF(E_LOG, L_HTTPD, "Error waiting for dispatch group\n");
 
   rsp_deinit();
   dacp_deinit();
   daap_deinit();
-
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-#endif
-  evhttp_free(evhttpd);
-  event_base_free(evbase_httpd);
 }
