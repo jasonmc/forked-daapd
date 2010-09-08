@@ -37,10 +37,9 @@
 #include <avl.h>
 #include <plist/plist.h>
 
-#include "evhttp/evhttp.h"
-
 #include "logger.h"
 #include "db.h"
+#include "http.h"
 #include "filescanner.h"
 #include "conffile.h"
 #include "misc.h"
@@ -273,7 +272,7 @@ find_track_file(char *location, char *base)
   int plen;
   int mfi_id;
 
-  location = evhttp_decode_uri(location);
+  http_decode_uri(location, URI_DECODE_NORMAL);
 
   plen = strlen("file://localhost/");
 
@@ -296,11 +295,7 @@ find_track_file(char *location, char *base)
       free(filename);
 
       if (mfi_id > 0)
-	{
-	  free(location);
-
-	  return mfi_id;
-	}
+	return mfi_id;
     }
 
   filename = strrchr(location, '/');
@@ -308,7 +303,6 @@ find_track_file(char *location, char *base)
     {
       DPRINTF(E_WARN, L_SCAN, "Could not extract filename from location\n");
 
-      free(location);
       return 0;
     }
 
@@ -317,16 +311,10 @@ find_track_file(char *location, char *base)
   /* Try to locate the file under the playlist location */
   mfi_id = db_file_id_byfilebase(filename, base);
   if (mfi_id > 0)
-    {
-      free(location);
-
-      return mfi_id;
-    }
+    return mfi_id;
 
   /* Last resort, filename only */
   mfi_id = db_file_id_byfile(filename);
-
-  free(location);
 
   return mfi_id;
 }
