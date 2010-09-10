@@ -37,8 +37,8 @@
 
 #include <uninorm.h>
 
+#include <dispatch/dispatch.h>
 #include <event.h>
-#include "evhttp/evhttp.h"
 
 #include <tre/tre.h>
 #include <avl.h>
@@ -47,15 +47,13 @@
 #include "db.h"
 #include "conffile.h"
 #include "misc.h"
+#include "http.h"
 #include "httpd.h"
 #include "transcode.h"
 #include "artwork.h"
 #include "httpd_daap.h"
 #include "daap_query.h"
 #include "dmap_common.h"
-
-/* httpd event base, from httpd.c */
-extern struct event_base *evbase_httpd;
 
 
 /* Session timeout in seconds */
@@ -67,20 +65,22 @@ extern struct event_base *evbase_httpd;
 struct uri_map {
   regex_t preg;
   char *regexp;
-  void (*handler)(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query);
+  int (*handler)(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri);
 };
 
 struct daap_session {
   int id;
 
-  struct event timeout;
+  dispatch_source_t timeout;
 };
 
 struct daap_update_request {
-  struct evhttp_request *req;
+  struct http_connection *c;
+  struct http_request *req;
+  struct http_response *r;
 
   /* Refresh tiemout */
-  struct event timeout;
+  dispatch_source_t timeout;
 
   struct daap_update_request *next;
 };
@@ -100,11 +100,13 @@ static char *default_meta_pl = "dmap.itemid,dmap.itemname,dmap.persistentid,com.
 static char *default_meta_group = "dmap.itemname,dmap.persistentid,daap.songalbumartist";
 
 /* DAAP session tracking */
+static dispatch_queue_t sessions_sq;
 static avl_tree_t *daap_sessions;
 static int next_session_id;
 
 /* Update requests */
 static int current_rev;
+static dispatch_queue_t updates_sq;
 static struct daap_update_request *update_requests;
 
 
@@ -124,6 +126,7 @@ daap_session_compare(const void *aa, const void *bb)
   return 0;
 }
 
+/* Queue: sessions_sq */
 static void
 daap_session_free(void *item)
 {
@@ -131,18 +134,26 @@ daap_session_free(void *item)
 
   s = (struct daap_session *)item;
 
-  evtimer_del(&s->timeout);
+  dispatch_source_cancel(s->timeout);
+  dispatch_release(s->timeout);
   free(s);
 }
 
+/* Queue: sessions_sq or HTTP read queue */
 static void
 daap_session_kill(struct daap_session *s)
 {
-  avl_delete(daap_sessions, s);
+  if (dispatch_get_current_queue() == sessions_sq)
+    avl_delete(daap_sessions, s);
+  else
+    dispatch_sync(sessions_sq, ^{
+	avl_delete(daap_sessions, s);
+      });
 }
 
+/* Queue: sessions_sq */
 static void
-daap_session_timeout_cb(int fd, short what, void *arg)
+daap_session_timeout_cb(void *arg)
 {
   struct daap_session *s;
 
@@ -153,97 +164,122 @@ daap_session_timeout_cb(int fd, short what, void *arg)
   daap_session_kill(s);
 }
 
+/* Queue: HTTP read queue */
 static struct daap_session *
 daap_session_register(void)
 {
-  struct timeval tv;
   struct daap_session *s;
-  avl_node_t *node;
-  int ret;
+  __block int b_ret;
 
   s = (struct daap_session *)malloc(sizeof(struct daap_session));
   if (!s)
     {
       DPRINTF(E_LOG, L_DAAP, "Out of memory for DAAP session\n");
+
       return NULL;
     }
 
   memset(s, 0, sizeof(struct daap_session));
 
-  s->id = next_session_id;
-
-  next_session_id++;
-
-  evtimer_set(&s->timeout, daap_session_timeout_cb, s);
-  event_base_set(evbase_httpd, &s->timeout);
-
-  node = avl_insert(daap_sessions, s);
-  if (!node)
+  s->timeout = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, sessions_sq);
+  if (!s->timeout)
     {
-      DPRINTF(E_LOG, L_DAAP, "Could not register DAAP session: %s\n", strerror(errno));
+      DPRINTF(E_LOG, L_DAAP, "Could not create dispatch source for session timeout\n");
 
       free(s);
       return NULL;
     }
 
-  evutil_timerclear(&tv);
-  tv.tv_sec = DAAP_SESSION_TIMEOUT;
+  dispatch_set_context(s->timeout, s);
+  dispatch_source_set_event_handler_f(s->timeout, daap_session_timeout_cb);
 
-  ret = evtimer_add(&s->timeout, &tv);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+  dispatch_source_set_timer(s->timeout,
+			    dispatch_time(DISPATCH_TIME_NOW, DAAP_SESSION_TIMEOUT * NSEC_PER_SEC),
+			    DISPATCH_TIME_FOREVER /* one-shot */, 30 * NSEC_PER_SEC);
+
+  dispatch_sync(sessions_sq, ^{
+      avl_node_t *node;
+
+      s->id = next_session_id;
+
+      next_session_id++;
+
+      node = avl_insert(daap_sessions, s);
+      if (!node)
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Could not register DAAP session: %s\n", strerror(errno));
+
+	  b_ret = -1;
+	  return;
+	}
+
+      dispatch_resume(s->timeout);
+
+      b_ret = 0;
+    });
+
+  if (b_ret < 0)
+    {
+      free(s);
+      return NULL;
+    }
 
   return s;
 }
 
-struct daap_session *
-daap_session_find(struct evhttp_request *req, struct evkeyvalq *query, struct evbuffer *evbuf)
+/* Queue: HTTP read queue */
+int
+daap_session_find(struct httpd_hdl *h, struct daap_session **s)
 {
-  struct daap_session needle;
-  struct timeval tv;
-  struct daap_session *s;
-  avl_node_t *node;
   const char *param;
+  int id;
   int ret;
 
-  param = evhttp_find_header(query, "session-id");
+  param = keyval_get(h->query, "session-id");
   if (!param)
     {
       DPRINTF(E_WARN, L_DAAP, "No session-id specified in request\n");
       goto invalid;
     }
 
-  ret = safe_atoi32(param, &needle.id);
+  ret = safe_atoi32(param, &id);
   if (ret < 0)
     goto invalid;
 
-  node = avl_search(daap_sessions, &needle);
-  if (!node)
-    {
-      DPRINTF(E_WARN, L_DAAP, "DAAP session id %d not found\n", needle.id);
-      goto invalid;
-    }
+  dispatch_sync(sessions_sq, ^{
+      struct daap_session needle;
+      avl_node_t *node;
 
-  s = (struct daap_session *)node->item;
+      needle.id = id;
 
-  event_del(&s->timeout);
+      node = avl_search(daap_sessions, &needle);
+      if (!node)
+	{
+	  DPRINTF(E_WARN, L_DAAP, "DAAP session id %d not found\n", needle.id);
 
-  evutil_timerclear(&tv);
-  tv.tv_sec = DAAP_SESSION_TIMEOUT;
+	  *s = NULL;
+	  return;
+	}
 
-  ret = evtimer_add(&s->timeout, &tv);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+      *s = (struct daap_session *)node->item;
 
-  return s;
+      dispatch_source_set_timer((*s)->timeout,
+				dispatch_time(DISPATCH_TIME_NOW, DAAP_SESSION_TIMEOUT * NSEC_PER_SEC),
+				DISPATCH_TIME_FOREVER /* one-shot */, 30 * NSEC_PER_SEC);
+    });
+
+  if (!*s)
+    goto invalid;
+
+  return 0;
 
  invalid:
-  evhttp_send_error(req, 403, "Forbidden");
-  return NULL;
+  return http_server_error_run(h->c, h->r, HTTP_FORBIDDEN, "Forbidden");
 }
 
 
 /* Update requests helpers */
+/* Queue: updates_sq */
 static void
 update_remove(struct daap_update_request *ur)
 {
@@ -269,13 +305,15 @@ update_remove(struct daap_update_request *ur)
 static void
 update_free(struct daap_update_request *ur)
 {
-  if (event_initialized(&ur->timeout))
-      evtimer_del(&ur->timeout);
+  dispatch_source_cancel(ur->timeout);
+  dispatch_release(ur->timeout);
+
   free(ur);
 }
 
+/* Queue: updates_sq */
 static void
-update_refresh_cb(int fd, short event, void *arg)
+update_refresh_cb(void *arg)
 {
   struct daap_update_request *ur;
   struct evbuffer *evbuf;
@@ -304,28 +342,47 @@ update_refresh_cb(int fd, short event, void *arg)
   dmap_add_int(evbuf, "mstt", 200);         /* 12 */
   dmap_add_int(evbuf, "musr", current_rev); /* 12 */
 
-  evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
+  ret = http_response_set_status(ur->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DAAP, "Could not set response status for DAAP update\n");
 
-  httpd_send_reply(ur->req, HTTP_OK, "OK", evbuf);
+      evbuffer_free(evbuf);
+      return;
+    }
+
+  http_response_set_body(ur->r, evbuf);
+
+  ret = http_server_response_thaw_and_run(ur->c, ur->r);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DAAP, "Could not thaw and run response to DAAP update request\n");
+
+      http_server_kill_connection(ur->c);
+    }
+
+  update_remove(ur);
+  update_free(ur);
+}
+
+/* Queue: updates_sq */
+static void
+update_free_cb_task(void *arg)
+{
+  struct daap_update_request *ur;
+
+  ur = (struct daap_update_request *)arg;
 
   update_remove(ur);
   update_free(ur);
 }
 
 static void
-update_fail_cb(struct evhttp_connection *evcon, void *arg)
+update_free_cb(void *data)
 {
-  struct daap_update_request *ur;
+  DPRINTF(E_DBG, L_DAAP, "Update request: connection closed\n");
 
-  ur = (struct daap_update_request *)arg;
-
-  DPRINTF(E_DBG, L_DAAP, "Update request: client closed connection\n");
-
-  if (ur->req->evcon)
-    evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
-
-  update_remove(ur);
-  update_free(ur);
+  dispatch_sync_f(updates_sq, data, update_free_cb_task);
 }
 
 
@@ -463,7 +520,7 @@ daap_sort_finalize(struct sort_ctx *ctx, struct evbuffer *evbuf)
 
 
 static void
-get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params *qp)
+get_query_params(struct keyval *query, int *sort_headers, struct query_params *qp)
 {
   const char *param;
   char *ptr;
@@ -474,7 +531,7 @@ get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params
   low = 0;
   high = -1; /* No limit */
 
-  param = evhttp_find_header(query, "index");
+  param = keyval_get(query, "index");
   if (param)
     {
       if (param[0] == '-') /* -n, last n entries */
@@ -517,7 +574,7 @@ get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params
   qp->idx_type = I_SUB;
 
   qp->sort = S_NONE;
-  param = evhttp_find_header(query, "sort");
+  param = keyval_get(query, "sort");
   if (param)
     {
       if (strcmp(param, "name") == 0)
@@ -536,7 +593,7 @@ get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params
   if (sort_headers)
     {
       *sort_headers = 0;
-      param = evhttp_find_header(query, "include-sort-headers");
+      param = keyval_get(query, "include-sort-headers");
       if (param)
 	{
 	  if (strcmp(param, "1") == 0)
@@ -549,9 +606,9 @@ get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params
 	}
     }
 
-  param = evhttp_find_header(query, "query");
+  param = keyval_get(query, "query");
   if (!param)
-    param = evhttp_find_header(query, "filter");
+    param = keyval_get(query, "filter");
 
   if (param)
     {
@@ -564,7 +621,7 @@ get_query_params(struct evkeyvalq *query, int *sort_headers, struct query_params
 }
 
 static int
-parse_meta(struct evhttp_request *req, char *tag, const char *param, const struct dmap_field ***out_meta)
+parse_meta(struct httpd_hdl *h, char *tag, const char *param, const struct dmap_field ***out_meta, int *out_nmeta)
 {
   const struct dmap_field **meta;
   char *ptr;
@@ -574,13 +631,14 @@ parse_meta(struct evhttp_request *req, char *tag, const char *param, const struc
   int nmeta;
   int i;
 
+  *out_nmeta = -1;
+
   metastr = strdup(param);
   if (!metastr)
     {
       DPRINTF(E_LOG, L_DAAP, "Could not duplicate meta parameter; out of memory\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-      return -1;
+      return dmap_send_error(h, tag, "Out of memory");
     }
 
   nmeta = 1;
@@ -595,10 +653,9 @@ parse_meta(struct evhttp_request *req, char *tag, const char *param, const struc
     {
       DPRINTF(E_LOG, L_DAAP, "Could not allocate meta array; out of memory\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      free(metastr);
 
-      nmeta = -1;
-      goto out;
+      return dmap_send_error(h, tag, "Out of memory");
     }
   memset(meta, 0, nmeta * sizeof(struct dmap_field *));
 
@@ -623,16 +680,16 @@ parse_meta(struct evhttp_request *req, char *tag, const char *param, const struc
   DPRINTF(E_DBG, L_DAAP, "Found %d meta tags\n", nmeta);
 
   *out_meta = meta;
+  *out_nmeta = nmeta;
 
- out:
   free(metastr);
 
-  return nmeta;
+  return 0;
 }
 
 
-static void
-daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_server_info(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   cfg_t *lib;
   char *name;
@@ -654,14 +711,14 @@ daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP server-info reply\n");
 
-      dmap_send_error(req, "msrv", "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "msrv", "Out of memory");
     }
 
   mpro = 2 << 16;
   apro = 3 << 16;
 
-  clientver = evhttp_find_header(req->input_headers, "Client-DAAP-Version");
+  clientver = http_request_get_header(h->req, "Client-DAAP-Version");
   if (clientver)
     {
       if (strcmp(clientver, "1.0") == 0)
@@ -698,11 +755,18 @@ daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char 
   /* Advertise updates support even though we don't send updates */
   dmap_add_char(evbuf, "msup", 1);   /* 9 */
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "msrv", "Server Error");
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-daap_reply_content_codes(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_content_codes(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   const struct dmap_field *dmap_fields;
   int nfields;
@@ -721,8 +785,8 @@ daap_reply_content_codes(struct evhttp_request *req, struct evbuffer *evbuf, cha
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP content-codes reply\n");
 
-      dmap_send_error(req, "mccr", "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mccr", "Out of memory");
     } 
 
   dmap_add_container(evbuf, "mccr", len);
@@ -738,11 +802,18 @@ daap_reply_content_codes(struct evhttp_request *req, struct evbuffer *evbuf, cha
       dmap_add_short(evbuf, "mcty", dmap_fields[i].type);  /* 10 */
     }
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mccr", "Server Error");
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_login(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct pairing_info pi;
   struct daap_session *s;
@@ -755,28 +826,28 @@ daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP login reply\n");
 
-      dmap_send_error(req, "mlog", "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mlog", "Out of memory");
     }
 
-  ua = evhttp_find_header(req->input_headers, "User-Agent");
+  ua = http_request_get_header(h->req, "User-Agent");
   if (!ua)
     {
       DPRINTF(E_LOG, L_DAAP, "No User-Agent header, rejecting login request\n");
 
-      evhttp_send_error(req, 403, "Forbidden");
-      return;
+      evbuffer_free(evbuf);
+      return http_server_error_run(h->c, h->r, HTTP_FORBIDDEN, "Forbidden");
     }
 
   if (strncmp(ua, "Remote", strlen("Remote")) == 0)
     {
-      guid = evhttp_find_header(query, "pairing-guid");
+      guid = keyval_get(h->query, "pairing-guid");
       if (!guid)
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Login attempt with U-A: Remote and no pairing-guid\n");
 
-	  evhttp_send_error(req, 403, "Forbidden");
-	  return;
+	  evbuffer_free(evbuf);
+	  return http_server_error_run(h->c, h->r, HTTP_FORBIDDEN, "Forbidden");
 	}
 
       memset(&pi, 0, sizeof(struct pairing_info));
@@ -788,8 +859,9 @@ daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
 	  DPRINTF(E_LOG, L_DAAP, "Login attempt with invalid pairing-guid\n");
 
 	  free_pi(&pi, 1);
-	  evhttp_send_error(req, 403, "Forbidden");
-	  return;
+
+	  evbuffer_free(evbuf);
+	  return http_server_error_run(h->c, h->r, HTTP_FORBIDDEN, "Forbidden");
 	}
 
       DPRINTF(E_INFO, L_DAAP, "Remote '%s' logging in with GUID %s\n", pi.name, pi.guid);
@@ -799,52 +871,75 @@ daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
   s = daap_session_register();
   if (!s)
     {
-      dmap_send_error(req, "mlog", "Could not start session");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mlog", "Could not start session");
     }
 
   dmap_add_container(evbuf, "mlog", 24);
   dmap_add_int(evbuf, "mstt", 200);        /* 12 */
   dmap_add_int(evbuf, "mlid", s->id); /* 12 */
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mlog", "Server Error");
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-daap_reply_logout(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_logout(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   daap_session_kill(s);
 
-  httpd_send_reply(req, 204, "Logout Successful", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "Logout Successful");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_update(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
-  struct timeval tv;
   struct daap_session *s;
   struct daap_update_request *ur;
   const char *param;
   int reqd_rev;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
-  param = evhttp_find_header(query, "revision-number");
+  param = keyval_get(h->query, "revision-number");
   if (!param)
     {
       DPRINTF(E_LOG, L_DAAP, "Missing revision-number in update request\n");
 
-      dmap_send_error(req, "mupd", "Invalid request");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mupd", "Invalid request");
     }
 
   ret = safe_atoi32(param, &reqd_rev);
@@ -852,8 +947,8 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Parameter revision-number not an integer\n");
 
-      dmap_send_error(req, "mupd", "Invalid request");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "mupd", "Invalid request");
     }
 
   if (reqd_rev == 1) /* Or revision is not valid */
@@ -863,8 +958,8 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP update reply\n");
 
-	  dmap_send_error(req, "mupd", "Out of memory");
-	  return;
+	  evbuffer_free(evbuf);
+	  return dmap_send_error(h, "mupd", "Out of memory");
 	}
 
       /* Send back current revision */
@@ -872,60 +967,82 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       dmap_add_int(evbuf, "mstt", 200);         /* 12 */
       dmap_add_int(evbuf, "musr", current_rev); /* 12 */
 
-      httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+      ret = http_response_set_status(h->r, HTTP_OK, "OK");
+      if (ret < 0)
+	{
+	  evbuffer_free(evbuf);
+	  return dmap_send_error(h, "mupd", "Internal error");
+	}
 
-      return;
+      return httpd_send_reply(h->c, h->req, h->r, evbuf);
     }
 
-  /* Else, just let the request hang until we have changes to push back */
+  evbuffer_free(evbuf);
+
   ur = (struct daap_update_request *)malloc(sizeof(struct daap_update_request));
   if (!ur)
     {
       DPRINTF(E_LOG, L_DAAP, "Out of memory for update request\n");
 
-      dmap_send_error(req, "mupd", "Out of memory");
-      return;
+      return dmap_send_error(h, "mupd", "Out of memory");
     }
   memset(ur, 0, sizeof(struct daap_update_request));
 
-  evtimer_set(&ur->timeout, update_refresh_cb, ur);
-  event_base_set(evbase_httpd, &ur->timeout);
-
-  evutil_timerclear(&tv);
-  tv.tv_sec = DAAP_UPDATE_REFRESH;
-
-  ret = evtimer_add(&ur->timeout, &tv);
-  if (ret < 0)
+  ur->timeout = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, updates_sq);
+  if (!ur->timeout)
     {
-      DPRINTF(E_LOG, L_DAAP, "Could not add update timeout event\n");
+      DPRINTF(E_LOG, L_DAAP, "Could not create dispatch source for update timeout\n");
 
-      dmap_send_error(req, "mupd", "Could not register timer");
-
-      update_free(ur);
-      return;
+      free(ur);
+      return dmap_send_error(h, "mupd", "Could not create timer");
     }
 
+  dispatch_set_context(ur->timeout, ur);
+  dispatch_source_set_event_handler_f(ur->timeout, update_refresh_cb);
+
+  dispatch_source_set_timer(ur->timeout,
+			    dispatch_time(DISPATCH_TIME_NOW, DAAP_UPDATE_REFRESH * NSEC_PER_SEC),
+			    DISPATCH_TIME_FOREVER /* one-shot */, 30 * NSEC_PER_SEC);
+
+  /* Freeze the request */
+  http_server_response_freeze(h->c, h->r, update_free_cb, ur);
+
   /* NOTE: we may need to keep reqd_rev in there too */
-  ur->req = req;
+  ur->c = h->c;
+  ur->req = h->req;
+  ur->r = h->r;
 
-  ur->next = update_requests;
-  update_requests = ur;
+  dispatch_sync(updates_sq, ^{
+      ur->next = update_requests;
+      update_requests = ur;
 
-  /* If the connection fails before we have an update to push out
-   * to the client, we need to know.
-   */
-  evhttp_connection_set_closecb(req->evcon, update_fail_cb, ur);
+      dispatch_resume(ur->timeout);
+    });
+
+  return 0;
 }
 
-static void
-daap_reply_activity(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_activity(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
+  int ret;
+
+  evbuffer_free(evbuf);
+
   /* That's so nice, thanks for letting us know */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+  return 0;
 }
 
-static void
-daap_reply_dblist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_dblist(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   cfg_t *lib;
@@ -934,9 +1051,12 @@ daap_reply_dblist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   int count;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
   lib = cfg_getsec(cfg, "library");
   name = cfg_getstr(lib, "name");
@@ -947,8 +1067,8 @@ daap_reply_dblist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP dblist reply\n");
 
-      dmap_send_error(req, "avdb", "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "avdb", "Out of memory");
     }
 
   dmap_add_container(evbuf, "avdb", 121 + namelen);
@@ -968,11 +1088,18 @@ daap_reply_dblist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   count = db_pl_get_count();
   dmap_add_int(evbuf, "mctc", count); /* 12 */
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "aply", "Server Error");
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, int playlist, struct evkeyvalq *query)
+static int
+daap_reply_songlist_generic(struct httpd_hdl *h, struct evbuffer *evbuf, int playlist)
 {
   struct query_params qp;
   struct db_media_file_info dbmfi;
@@ -1000,8 +1127,8 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP song list reply\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-      return;
+      ret = dmap_send_error(h, tag, "Out of memory");
+      goto out_evbuf_free;
     }
 
   songlist = evbuffer_new();
@@ -1009,8 +1136,8 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP song list\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-      return;
+      ret = dmap_send_error(h, tag, "Out of memory");
+      goto out_evbuf_free;
     }
 
   /* Start with a big enough evbuffer - it'll expand as needed */
@@ -1019,7 +1146,7 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP song list\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      ret = dmap_send_error(h, tag, "Out of memory");
       goto out_list_free;
     }
 
@@ -1028,7 +1155,7 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP song block\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      ret = dmap_send_error(h, tag, "Out of memory");
       goto out_list_free;
     }
 
@@ -1038,11 +1165,11 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP song block\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      ret = dmap_send_error(h, tag, "Out of memory");
       goto out_song_free;
     }
 
-  param = evhttp_find_header(query, "meta");
+  param = keyval_get(h->query, "meta");
   if (!param)
     {
       DPRINTF(E_DBG, L_DAAP, "No meta parameter in query, using default\n");
@@ -1053,11 +1180,12 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 
   if (param)
     {
-      nmeta = parse_meta(req, tag, param, &meta);
+      ret = parse_meta(h, tag, param, &meta, &nmeta);
       if (nmeta < 0)
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Failed to parse meta parameter in DAAP query\n");
 
+	  /* retval from parse_meta() */
 	  goto out_song_free;
 	}
     }
@@ -1068,7 +1196,7 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     }
 
   memset(&qp, 0, sizeof(struct query_params));
-  get_query_params(query, &sort_headers, &qp);
+  get_query_params(h->query, &sort_headers, &qp);
 
   sctx = NULL;
   if (sort_headers)
@@ -1078,7 +1206,7 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not create sort context\n");
 
-	  dmap_send_error(req, tag, "Out of memory");
+	  ret = dmap_send_error(h, tag, "Out of memory");
 	  goto out_query_free;
 	}
     }
@@ -1096,11 +1224,10 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
-      dmap_send_error(req, tag, "Could not start query");
-
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
+      ret = dmap_send_error(h, tag, "Could not start query");
       goto out_query_free;
     }
 
@@ -1109,7 +1236,7 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       nsongs++;
 
-      transcode = transcode_needed(req->input_headers, dbmfi.codectype);
+      transcode = transcode_needed(h->req, dbmfi.codectype);
 
       ret = dmap_encode_file_metadata(songlist, song, &dbmfi, meta, nmeta, 1, transcode);
       if (ret < 0)
@@ -1147,18 +1274,18 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 
   if (ret < 0)
     {
-      if (ret == -100)
-	  dmap_send_error(req, tag, "Out of memory");
-      else
-	{
-	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
-	  dmap_send_error(req, tag, "Error fetching query results");
-	}
-
       db_query_end(&qp);
 
       if (sort_headers)
 	daap_sort_context_free(sctx);
+
+      if (ret == -100)
+	ret = dmap_send_error(h , tag, "Out of memory");
+      else
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+	  ret = dmap_send_error(h, tag, "Error fetching query results");
+	}
 
       goto out_list_free;
     }
@@ -1182,12 +1309,11 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DAAP, "Could not add song list to DAAP song list reply\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
-      return;
+      ret = dmap_send_error(h, tag, "Out of memory");
+      goto out_evbuf_free;
     }
 
   if (sort_headers)
@@ -1199,14 +1325,19 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not add sort headers to DAAP song list reply\n");
 
-	  dmap_send_error(req, tag, "Out of memory");
-	  return;
+	  ret = dmap_send_error(h, tag, "Out of memory");
+	  goto out_evbuf_free;
 	}
     }
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      ret = dmap_send_error(h, "aply", "Server Error");
+      goto out_evbuf_free;
+    }
 
-  return;
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 
  out_query_free:
   if (nmeta > 0)
@@ -1220,44 +1351,55 @@ daap_reply_songlist_generic(struct evhttp_request *req, struct evbuffer *evbuf, 
 
  out_list_free:
   evbuffer_free(songlist);
+
+ out_evbuf_free:
+  evbuffer_free(evbuf);
+
+  return ret;
 }
 
-static void
-daap_reply_dbsonglist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_dbsonglist(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
-  daap_reply_songlist_generic(req, evbuf, -1, query);
+  return daap_reply_songlist_generic(h, evbuf, -1);
 }
 
-static void
-daap_reply_plsonglist(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_plsonglist(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   int playlist;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
   ret = safe_atoi32(uri[3], &playlist);
   if (ret < 0)
     {
-      dmap_send_error(req, "apso", "Invalid playlist ID");
-
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "apso", "Invalid playlist ID");
     }
 
-  daap_reply_songlist_generic(req, evbuf, playlist, query);
+  return daap_reply_songlist_generic(h, evbuf, playlist);
 }
 
-static void
-daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_playlists(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct query_params qp;
   struct db_playlist_info dbpli;
@@ -1275,17 +1417,20 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
   int i;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
   ret = evbuffer_expand(evbuf, 61);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP playlists reply\n");
 
-      dmap_send_error(req, "aply", "Out of memory");
-      return;
+      ret = dmap_send_error(h, "aply", "Out of memory");
+      goto out_evbuf_free;
     }
 
   playlistlist = evbuffer_new();
@@ -1293,8 +1438,8 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP playlist list\n");
 
-      dmap_send_error(req, "aply", "Out of memory");
-      return;
+      ret = dmap_send_error(h, "aply", "Out of memory");
+      goto out_evbuf_free;
     }
 
   /* Start with a big enough evbuffer - it'll expand as needed */
@@ -1303,7 +1448,7 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP playlist list\n");
 
-      dmap_send_error(req, "aply", "Out of memory");
+      ret = dmap_send_error(h, "aply", "Out of memory");
       goto out_list_free;
     }
 
@@ -1312,7 +1457,7 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP playlist block\n");
 
-      dmap_send_error(req, "aply", "Out of memory");
+      ret = dmap_send_error(h, "aply", "Out of memory");
       goto out_list_free;
     }
 
@@ -1322,11 +1467,11 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP playlist block\n");
 
-      dmap_send_error(req, "aply", "Out of memory");
+      ret = dmap_send_error(h, "aply", "Out of memory");
       goto out_pl_free;
     }
 
-  param = evhttp_find_header(query, "meta");
+  param = keyval_get(h->query, "meta");
   if (!param)
     {
       DPRINTF(E_LOG, L_DAAP, "No meta parameter in query, using default\n");
@@ -1334,16 +1479,17 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
       param = default_meta_pl;
     }
 
-  nmeta = parse_meta(req, "aply", param, &meta);
+  ret = parse_meta(h, "aply", param, &meta, &nmeta);
   if (nmeta < 0)
     {
       DPRINTF(E_LOG, L_DAAP, "Failed to parse meta parameter in DAAP query\n");
 
+      /* retval from parse_meta() */
       goto out_pl_free;
     }
 
   memset(&qp, 0, sizeof(struct query_params));
-  get_query_params(query, NULL, &qp);
+  get_query_params(h->query, NULL, &qp);
   qp.type = Q_PL;
 
   ret = db_query_start(&qp);
@@ -1351,7 +1497,7 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
-      dmap_send_error(req, "aply", "Could not start query");
+      ret = dmap_send_error(h, "aply", "Could not start query");
       goto out_query_free;
     }
 
@@ -1444,15 +1590,16 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
 
   if (ret < 0)
     {
+      db_query_end(&qp);
+
       if (ret == -100)
-	dmap_send_error(req, "aply", "Out of memory");
+	ret = dmap_send_error(h, "aply", "Out of memory");
       else
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
-	  dmap_send_error(req, "aply", "Error fetching query results");
+	  ret = dmap_send_error(h, "aply", "Error fetching query results");
 	}
 
-      db_query_end(&qp);
       goto out_list_free;
     }
 
@@ -1472,13 +1619,18 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not add playlist list to DAAP playlists reply\n");
 
-      dmap_send_error(req, "aply", "Out of memory");
-      return;
+      ret = dmap_send_error(h, "aply", "Out of memory");
+      goto out_evbuf_free;
     }
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      ret = dmap_send_error(h, "aply", "Server Error");
+      goto out_evbuf_free;
+    }
 
-  return;
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 
  out_query_free:
   free(meta);
@@ -1490,10 +1642,15 @@ daap_reply_playlists(struct evhttp_request *req, struct evbuffer *evbuf, char **
 
  out_list_free:
   evbuffer_free(playlistlist);
+
+ out_evbuf_free:
+  evbuffer_free(evbuf);
+
+  return ret;
 }
 
-static void
-daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_groups(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct query_params qp;
   struct db_group_info dbgri;
@@ -1514,9 +1671,12 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   int ret;
   char *tag;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
   /* For now we only support album groups */
   tag = "agal";
@@ -1526,8 +1686,8 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP groups reply\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-      return;
+      ret = dmap_send_error(h, tag, "Out of memory");
+      goto out_evbuf_free;
     }
 
   grouplist = evbuffer_new();
@@ -1535,8 +1695,8 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP group list\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-      return;
+      ret = dmap_send_error(h, tag, "Out of memory");
+      goto out_evbuf_free;
     }
 
   /* Start with a big enough evbuffer - it'll expand as needed */
@@ -1545,7 +1705,7 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP group list\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      ret = dmap_send_error(h, tag, "Out of memory");
       goto out_list_free;
     }
 
@@ -1554,7 +1714,7 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP group block\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      ret = dmap_send_error(h, tag, "Out of memory");
       goto out_list_free;
     }
 
@@ -1564,11 +1724,11 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP group block\n");
 
-      dmap_send_error(req, tag, "Out of memory");
+      ret = dmap_send_error(h, tag, "Out of memory");
       goto out_group_free;
     }
 
-  param = evhttp_find_header(query, "meta");
+  param = keyval_get(h->query, "meta");
   if (!param)
     {
       DPRINTF(E_LOG, L_DAAP, "No meta parameter in query, using default\n");
@@ -1576,16 +1736,17 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       param = default_meta_group;
     }
 
-  nmeta = parse_meta(req, tag, param, &meta);
+  ret = parse_meta(h, tag, param, &meta, &nmeta);
   if (nmeta < 0)
     {
       DPRINTF(E_LOG, L_DAAP, "Failed to parse meta parameter in DAAP query\n");
 
+      /* retval from parse_meta() */
       goto out_group_free;
     }
 
   memset(&qp, 0, sizeof(struct query_params));
-  get_query_params(query, &sort_headers, &qp);
+  get_query_params(h->query, &sort_headers, &qp);
   qp.type = Q_GROUPS;
 
   sctx = NULL;
@@ -1596,7 +1757,7 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not create sort context\n");
 
-	  dmap_send_error(req, tag, "Out of memory");
+	  ret = dmap_send_error(h, tag, "Out of memory");
 	  goto out_query_free;
 	}
     }
@@ -1606,11 +1767,10 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
-      dmap_send_error(req, tag, "Could not start query");
-
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
+      ret = dmap_send_error(h, tag, "Could not start query");
       goto out_query_free;
     }
 
@@ -1692,18 +1852,18 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 
   if (ret < 0)
     {
-      if (ret == -100)
-	dmap_send_error(req, tag, "Out of memory");
-      else
-	{
-	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
-	  dmap_send_error(req, tag, "Error fetching query results");
-	}
-
       db_query_end(&qp);
 
       if (sort_headers)
 	daap_sort_context_free(sctx);
+
+      if (ret == -100)
+	ret = dmap_send_error(h, tag, "Out of memory");
+      else
+	{
+	  DPRINTF(E_LOG, L_DAAP, "Error fetching results\n");
+	  ret = dmap_send_error(h, tag, "Error fetching query results");
+	}
 
       goto out_list_free;
     }
@@ -1728,12 +1888,11 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not add group list to DAAP groups reply\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
-      return;
+      ret = dmap_send_error(h, tag, "Out of memory");
+      goto out_evbuf_free;
     }
 
   if (sort_headers)
@@ -1745,14 +1904,19 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not add sort headers to DAAP browse reply\n");
 
-	  dmap_send_error(req, tag, "Out of memory");
-	  return;
+	  ret = dmap_send_error(h, tag, "Out of memory");
+	  goto out_evbuf_free;
 	}
     }
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      ret = dmap_send_error(h, tag, "Server Error");
+      goto out_evbuf_free;
+    }
 
-  return;
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 
  out_query_free:
   free(meta);
@@ -1764,10 +1928,15 @@ daap_reply_groups(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 
  out_list_free:
   evbuffer_free(grouplist);
+
+ out_evbuf_free:
+  evbuffer_free(evbuf);
+
+  return ret;
 }
 
-static void
-daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_browse(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct query_params qp;
   struct daap_session *s;
@@ -1780,9 +1949,12 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
   int nitems;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
   memset(&qp, 0, sizeof(struct query_params));
 
@@ -1810,8 +1982,8 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Invalid DAAP browse request type '%s'\n", uri[3]);
 
-      dmap_send_error(req, "abro", "Invalid browse type");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "abro", "Invalid browse type");
     }
 
   ret = evbuffer_expand(evbuf, 52);
@@ -1819,8 +1991,8 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP browse reply\n");
 
-      dmap_send_error(req, "abro", "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "abro", "Out of memory");
     }
 
   itemlist = evbuffer_new();
@@ -1828,8 +2000,8 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP browse item list\n");
 
-      dmap_send_error(req, "abro", "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "abro", "Out of memory");
     }
 
   /* Start with a big enough evbuffer - it'll expand as needed */
@@ -1838,13 +2010,13 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DMAP browse item list\n");
 
-      dmap_send_error(req, "abro", "Out of memory");
-
+      evbuffer_free(evbuf);
       evbuffer_free(itemlist);
-      return;
+
+      return dmap_send_error(h, "abro", "Out of memory");
     }
 
-  get_query_params(query, &sort_headers, &qp);
+  get_query_params(h->query, &sort_headers, &qp);
 
   sctx = NULL;
   if (sort_headers)
@@ -1854,12 +2026,12 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not create sort context\n");
 
-	  dmap_send_error(req, "abro", "Out of memory");
-
+	  evbuffer_free(evbuf);
 	  evbuffer_free(itemlist);
 	  if (qp.filter)
 	    free(qp.filter);
-	  return;
+
+	  return dmap_send_error(h, "abro", "Out of memory");
 	}
     }
 
@@ -1868,15 +2040,15 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not start query\n");
 
-      dmap_send_error(req, "abro", "Could not start query");
-
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
+      evbuffer_free(evbuf);
       evbuffer_free(itemlist);
       if (qp.filter)
 	free(qp.filter);
-      return;
+
+      return dmap_send_error(h, "abro", "Could not start query");
     }
 
   nitems = 0;
@@ -1905,14 +2077,15 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Error fetching/building results\n");
 
-      dmap_send_error(req, "abro", "Error fetching/building query results");
       db_query_end(&qp);
 
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
+      evbuffer_free(evbuf);
       evbuffer_free(itemlist);
-      return;
+
+      return dmap_send_error(h, "abro", "Error fetching/building query results");
     }
 
   if (sort_headers)
@@ -1934,12 +2107,12 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Could not add item list to DAAP browse reply\n");
 
-      dmap_send_error(req, tag, "Out of memory");
-
       if (sort_headers)
 	daap_sort_context_free(sctx);
 
-      return;
+      evbuffer_free(evbuf);
+
+      return dmap_send_error(h, tag, "Out of memory");
     }
 
   if (sort_headers)
@@ -1951,17 +2124,26 @@ daap_reply_browse(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Could not add sort headers to DAAP browse reply\n");
 
-	  dmap_send_error(req, tag, "Out of memory");
-	  return;
+	  evbuffer_free(evbuf);
+
+	  return dmap_send_error(h, tag, "Out of memory");
 	}
     }
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      evbuffer_free(evbuf);
+
+      return dmap_send_error(h, tag, "Server error");
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
 /* NOTE: We only handle artwork at the moment */
-static void
-daap_reply_extra_data(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_extra_data(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   char clen[32];
   struct daap_session *s;
@@ -1972,24 +2154,23 @@ daap_reply_extra_data(struct evhttp_request *req, struct evbuffer *evbuf, char *
   int max_h;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
   ret = safe_atoi32(uri[3], &id);
   if (ret < 0)
-    {
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
-    }
+    goto bad_request;
 
-  param = evhttp_find_header(query, "mw");
+  param = keyval_get(h->query, "mw");
   if (!param)
     {
       DPRINTF(E_LOG, L_DAAP, "Request for artwork without mw parameter\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
   ret = safe_atoi32(param, &max_w);
@@ -1997,17 +2178,15 @@ daap_reply_extra_data(struct evhttp_request *req, struct evbuffer *evbuf, char *
     {
       DPRINTF(E_LOG, L_DAAP, "Could not convert mw parameter to integer\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
-  param = evhttp_find_header(query, "mh");
+  param = keyval_get(h->query, "mh");
   if (!param)
     {
       DPRINTF(E_LOG, L_DAAP, "Request for artwork without mh parameter\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
   ret = safe_atoi32(param, &max_h);
@@ -2015,8 +2194,7 @@ daap_reply_extra_data(struct evhttp_request *req, struct evbuffer *evbuf, char *
     {
       DPRINTF(E_LOG, L_DAAP, "Could not convert mh parameter to integer\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
   if (strcmp(uri[2], "groups") == 0)
@@ -2035,46 +2213,77 @@ daap_reply_extra_data(struct evhttp_request *req, struct evbuffer *evbuf, char *
 	break;
 
       default:
-	if (EVBUFFER_LENGTH(evbuf) > 0)
-	  evbuffer_drain(evbuf, EVBUFFER_LENGTH(evbuf));
-
 	goto no_artwork;
     }
 
-  evhttp_remove_header(req->output_headers, "Content-Type");
-  evhttp_add_header(req->output_headers, "Content-Type", ctype);
+  http_response_set_body(h->r, evbuf);
+
+  http_response_remove_header(h->r, "Content-Type");
+  ret = http_response_add_header(h->r, "Content-Type", ctype);
+  if (ret < 0)
+    goto out_error;
+
   snprintf(clen, sizeof(clen), "%ld", (long)EVBUFFER_LENGTH(evbuf));
-  evhttp_add_header(req->output_headers, "Content-Length", clen);
+  ret = http_response_add_header(h->r, "Content-Length", clen);
+  if (ret < 0)
+    goto out_error;
 
   /* No gzip compression for artwork */
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
-  return;
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
 
  no_artwork:
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  evbuffer_free(evbuf);
+
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+ bad_request:
+  evbuffer_free(evbuf);
+
+  return http_server_error_run(h->c, h->r, HTTP_BAD_REQUEST, "Bad Request");
 }
 
-static void
-daap_stream(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_stream(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   int id;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   ret = safe_atoi32(uri[3], &id);
   if (ret < 0)
-    evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-  else
-    httpd_stream_file(req, id);
+    return http_server_error_run(h->c, h->r, HTTP_BAD_REQUEST, "Bad Request");
+
+  return httpd_stream_file(h->c, h->req, h->r, id);
 }
 
 
 static char *
-daap_fix_request_uri(struct evhttp_request *req, char *uri)
+daap_fix_request_uri(char *uri)
 {
   char *ret;
 
@@ -2084,12 +2293,6 @@ daap_fix_request_uri(struct evhttp_request *req, char *uri)
 
   if (strncmp(uri, "daap://", strlen("daap://")) != 0)
     return uri;
-
-  /* Clear the proxy request flag set by evhttp
-   * due to the request URI being absolute.
-   * It has side-effects on Connection: keep-alive
-   */
-  req->flags &= ~EVHTTP_PROXY_REQUEST;
 
   ret = strchr(uri + strlen("daap://"), '/');
   if (!ret)
@@ -2114,8 +2317,8 @@ static const struct dmap_field dmap_TST7 = { "test.ulong",     "TST7", NULL, DMA
 static const struct dmap_field dmap_TST8 = { "test.long",      "TST8", NULL, DMAP_TYPE_LONG };
 static const struct dmap_field dmap_TST9 = { "test.string",    "TST9", NULL, DMAP_TYPE_STRING };
 
-static void
-daap_reply_dmap_test(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+daap_reply_dmap_test(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   char buf[64];
   struct evbuffer *test;
@@ -2126,8 +2329,8 @@ daap_reply_dmap_test(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not create evbuffer for DMAP test\n");
 
-      dmap_send_error(req, dmap_TEST.tag, "Out of memory");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, dmap_TEST.tag, "Out of memory");
     }
 
   /* UBYTE */
@@ -2191,11 +2394,24 @@ daap_reply_dmap_test(struct evhttp_request *req, struct evbuffer *evbuf, char **
     {
       DPRINTF(E_LOG, L_DAAP, "Could not add test results to DMAP test reply\n");
 
-      dmap_send_error(req, dmap_TEST.tag, "Out of memory");
-      return;      
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, dmap_TEST.tag, "Out of memory");
     }
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  http_response_set_body(r, evbuf);
+
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 #endif /* DMAP_TEST */
 
@@ -2276,15 +2492,16 @@ static struct uri_map daap_handlers[] =
   };
 
 
-void
-daap_request(struct evhttp_request *req)
+int
+daap_request(struct http_connection *c, struct http_request *req, struct http_response *r)
 {
+  struct httpd_hdl hdl;
+  struct keyval query;
   char *full_uri;
   char *uri;
   char *ptr;
   char *uri_parts[7];
   struct evbuffer *evbuf;
-  struct evkeyvalq query;
   const char *ua;
   cfg_t *lib;
   char *libname;
@@ -2293,21 +2510,19 @@ daap_request(struct evhttp_request *req)
   int ret;
   int i;
 
-  memset(&query, 0, sizeof(struct evkeyvalq));
+  memset(&query, 0, sizeof(struct keyval));
+  memset(&hdl, 0, sizeof(struct httpd_hdl));
 
   full_uri = httpd_fixup_uri(req);
   if (!full_uri)
-    {
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
-    }
+    return http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
 
-  ptr = daap_fix_request_uri(req, full_uri);
+  ptr = daap_fix_request_uri(full_uri);
   if (!ptr)
     {
       free(full_uri);
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+
+      return http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
     }
 
   if (ptr != full_uri)
@@ -2316,10 +2531,7 @@ daap_request(struct evhttp_request *req)
       free(full_uri);
 
       if (!uri)
-	{
-	  evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-	  return;
-	}
+	return http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 
       full_uri = uri;
     }
@@ -2332,16 +2544,14 @@ daap_request(struct evhttp_request *req)
   if (!uri)
     {
       free(full_uri);
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+
+      return http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
     }
 
   if (ptr)
     *ptr = '?';
 
-  ptr = uri;
-  uri = evhttp_decode_uri(uri);
-  free(ptr);
+  http_decode_uri(uri, URI_DECODE_NORMAL);
 
   DPRINTF(E_DBG, L_DAAP, "DAAP request: %s\n", full_uri);
 
@@ -2360,11 +2570,8 @@ daap_request(struct evhttp_request *req)
     {
       DPRINTF(E_LOG, L_DAAP, "Unrecognized DAAP request\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-
-      free(uri);
-      free(full_uri);
-      return;
+      ret = http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
+      goto out;
     }
 
   /* Check authentication */
@@ -2382,7 +2589,7 @@ daap_request(struct evhttp_request *req)
    * valid session-id that Remote can only obtain if its pairing-guid is in
    * our database. So HTTP authentication is waived for Remote.
    */
-  ua = evhttp_find_header(req->input_headers, "User-Agent");
+  ua = http_request_get_header(req, "User-Agent");
   if ((ua) && (strncmp(ua, "Remote", strlen("Remote")) == 0))
     passwd = NULL;
 
@@ -2393,15 +2600,22 @@ daap_request(struct evhttp_request *req)
       DPRINTF(E_DBG, L_HTTPD, "Checking authentication for library '%s'\n", libname);
 
       /* We don't care about the username */
-      ret = httpd_basic_auth(req, NULL, passwd, libname);
-      if (ret != 0)
+      ret = httpd_basic_auth(c, req, r, NULL, passwd, libname);
+      switch (ret)
 	{
-	  free(uri);
-	  free(full_uri);
-	  return;
-	}
+	  case HTTP_OK:
+	    DPRINTF(E_DBG, L_HTTPD, "Library authentication successful\n");
+	    break;
 
-      DPRINTF(E_DBG, L_HTTPD, "Library authentication successful\n");
+	  case -1:
+	    ret = -1;
+	    goto out;
+
+	  default:
+	    /* HTTP_UNAUTHORIZED or HTTP_INTERNAL_ERROR on error */
+	    ret = 0;
+	    goto out;
+	}
     }
 
   memset(uri_parts, 0, sizeof(uri_parts));
@@ -2416,47 +2630,85 @@ daap_request(struct evhttp_request *req)
     {
       DPRINTF(E_LOG, L_DAAP, "DAAP URI has too many/few components (%d)\n", (uri_parts[0]) ? i : 0);
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-
-      free(uri);
-      free(full_uri);
-      return;
+      ret = http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
+      goto out;
     }
 
+  ret = http_parse_query_string(full_uri, &query);
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out;
+    }
+
+  ret = http_response_add_header(r, "Accept-Ranges", "bytes");
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
+
+  ret = http_response_add_header(r, "DAAP-Server", PACKAGE "/" VERSION);
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
+
+  /* Content-Type for all replies, even the actual audio streaming. Note that
+   * video streaming will override this Content-Type with a more appropriate
+   * video/<type> Content-Type as expected by clients like Front Row.
+   */
+  ret = http_response_add_header(r, "Content-Type", "application/x-dmap-tagged");
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
+
+  /* Freed in the handler */
   evbuf = evbuffer_new();
   if (!evbuf)
     {
       DPRINTF(E_LOG, L_DAAP, "Could not allocate evbuffer for DAAP reply\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
-      free(uri);
-      free(full_uri);
-      return;
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
     }
 
-  evhttp_parse_query(full_uri, &query);
+  ret = db_pool_get();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RSP, "Could not acquire database connection\n");
 
-  evhttp_add_header(req->output_headers, "Accept-Ranges", "bytes");
-  evhttp_add_header(req->output_headers, "DAAP-Server", "forked-daapd/" VERSION);
-  /* Content-Type for all replies, even the actual audio streaming. Note that
-   * video streaming will override this Content-Type with a more appropriate
-   * video/<type> Content-Type as expected by clients like Front Row.
-   */
-  evhttp_add_header(req->output_headers, "Content-Type", "application/x-dmap-tagged");
+      evbuffer_free(evbuf);
 
-  daap_handlers[handler].handler(req, evbuf, uri_parts, &query);
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
 
-  evbuffer_free(evbuf);
-  evhttp_clear_headers(&query);
+  hdl.c = c;
+  hdl.req = req;
+  hdl.r = r;
+  hdl.query = &query;
+
+  ret = daap_handlers[handler].handler(&hdl, evbuf, uri_parts);
+
+  db_pool_release();
+
+ out_clear_query:
+  keyval_clear(&query);
+ out:
   free(uri);
   free(full_uri);
+
+  return ret;
 }
 
 int
-daap_is_request(struct evhttp_request *req, char *uri)
+daap_is_request(char *uri)
 {
-  uri = daap_fix_request_uri(req, uri);
+  uri = daap_fix_request_uri(uri);
   if (!uri)
     return 0;
 
@@ -2496,6 +2748,22 @@ daap_init(void)
   current_rev = 2;
   update_requests = NULL;
 
+  sessions_sq = dispatch_queue_create("org.forked-daapd.daap.sessions", NULL);
+  if (!sessions_sq)
+    {
+      DPRINTF(E_FATAL, L_DAAP, "Could not create dispatch queue for DAAP sessions\n");
+
+      return -1;
+    }
+
+  updates_sq = dispatch_queue_create("org.forked-daapd.daap.updates", NULL);
+  if (!updates_sq)
+    {
+      DPRINTF(E_FATAL, L_DAAP, "Could not create dispatch queue for DAAP update requests\n");
+
+      goto updates_sq_fail;
+    }
+
   for (i = 0; daap_handlers[i].handler; i++)
     {
       ret = tre_regcomp(&daap_handlers[i].preg, daap_handlers[i].regexp, REG_EXTENDED | REG_NOSUB);
@@ -2504,7 +2772,7 @@ daap_init(void)
           tre_regerror(ret, &daap_handlers[i].preg, buf, sizeof(buf));
 
           DPRINTF(E_FATAL, L_DAAP, "DAAP init failed; regexp error: %s\n", buf);
-	  return -1;
+	  goto regexp_fail;
         }
     }
 
@@ -2521,6 +2789,10 @@ daap_init(void)
  daap_avl_alloc_fail:
   for (i = 0; daap_handlers[i].handler; i++)
     tre_regfree(&daap_handlers[i].preg);
+ regexp_fail:
+  dispatch_release(updates_sq);
+ updates_sq_fail:
+  dispatch_release(sessions_sq);
 
   return -1;
 }
@@ -2528,7 +2800,6 @@ daap_init(void)
 void
 daap_deinit(void)
 {
-  struct daap_update_request *ur;
   int i;
 
   for (i = 0; daap_handlers[i].handler; i++)
@@ -2536,16 +2807,8 @@ daap_deinit(void)
 
   avl_free_tree(daap_sessions);
 
-  for (ur = update_requests; update_requests; ur = update_requests)
-    {
-      update_requests = ur->next;
+  dispatch_release(sessions_sq);
+  dispatch_release(updates_sq);
 
-      if (ur->req->evcon)
-	{
-	  evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
-	  evhttp_connection_free(ur->req->evcon);
-	}
-
-      update_free(ur);
-    }
+  /* Pending update requests are removed during HTTP server shutdown */
 }
