@@ -24,11 +24,11 @@
 #include <stdint.h>
 
 #include <event.h>
-#include "evhttp/evhttp.h"
 
 #include "db.h"
 #include "misc.h"
 #include "logger.h"
+#include "http.h"
 #include "dmap_common.h"
 
 
@@ -329,8 +329,8 @@ dmap_add_field(struct evbuffer *evbuf, const struct dmap_field *df, char *strval
 }
 
 
-void
-dmap_send_error(struct evhttp_request *req, char *container, char *errmsg)
+int
+dmap_send_error(struct httpd_hdl *h, char *container, char *errmsg)
 {
   struct evbuffer *evbuf;
   int len;
@@ -339,10 +339,9 @@ dmap_send_error(struct evhttp_request *req, char *container, char *errmsg)
   evbuf = evbuffer_new();
   if (!evbuf)
     {
-      DPRINTF(E_LOG, L_DMAP, "Could not allocate evbuffer for DMAP error\n");
+      DPRINTF(E_LOG, L_DAAP, "Could not allocate evbuffer for DAAP error\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   len = 12 + 8 + 8 + strlen(errmsg);
@@ -350,21 +349,31 @@ dmap_send_error(struct evhttp_request *req, char *container, char *errmsg)
   ret = evbuffer_expand(evbuf, len);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_DMAP, "Could not expand evbuffer for DMAP error\n");
-
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
+      DPRINTF(E_LOG, L_DAAP, "Could not expand evbuffer for DAAP error\n");
 
       evbuffer_free(evbuf);
-      return;
+
+      goto out_error;
     }
 
   dmap_add_container(evbuf, container, len - 8);
   dmap_add_int(evbuf, "mstt", 500);
   dmap_add_string(evbuf, "msts", errmsg);
 
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
+  http_response_set_body(h->r, evbuf);
 
-  evbuffer_free(evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
 

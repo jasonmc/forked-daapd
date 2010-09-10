@@ -3,9 +3,9 @@
 #define __DMAP_HELPERS_H__
 
 #include <event.h>
-#include "evhttp/evhttp.h"
 
 #include "db.h"
+#include "httpd.h"
 
 enum dmap_type
   {
@@ -74,8 +74,8 @@ void
 dmap_add_field(struct evbuffer *evbuf, const struct dmap_field *df, char *strval, int32_t intval);
 
 
-void
-dmap_send_error(struct evhttp_request *req, char *container, char *errmsg);
+int
+dmap_send_error(struct httpd_hdl *h, char *container, char *errmsg);
 
 
 int
