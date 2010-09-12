@@ -31,13 +31,8 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#if defined(HAVE_SYS_EVENTFD_H) && defined(HAVE_EVENTFD)
-# define USE_EVENTFD
-# include <sys/eventfd.h>
-#endif
-
+#include <dispatch/dispatch.h>
 #include <event.h>
-#include "evhttp/evhttp.h"
 
 #include <tre/tre.h>
 
@@ -45,6 +40,7 @@
 #include "misc.h"
 #include "conffile.h"
 #include "artwork.h"
+#include "http.h"
 #include "httpd.h"
 #include "httpd_dacp.h"
 #include "dmap_common.h"
@@ -52,30 +48,29 @@
 #include "player.h"
 
 
-/* httpd event base, from httpd.c */
-extern struct event_base *evbase_httpd;
-
 /* From httpd_daap.c */
 struct daap_session;
 
-struct daap_session *
-daap_session_find(struct evhttp_request *req, struct evkeyvalq *query, struct evbuffer *evbuf);
+int
+daap_session_find(struct httpd_hdl *h, struct daap_session **s);
 
 
 struct uri_map {
   regex_t preg;
   char *regexp;
-  void (*handler)(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query);
+  int (*handler)(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri);
 };
 
 struct dacp_update_request {
-  struct evhttp_request *req;
+  struct http_connection *c;
+  struct http_request *req;
+  struct http_response *r;
 
   struct dacp_update_request *next;
 };
 
 typedef void (*dacp_propget)(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
-typedef void (*dacp_propset)(const char *value, struct evkeyvalq *query);
+typedef void (*dacp_propset)(const char *value, struct keyval *query);
 
 struct dacp_prop_map {
   char *desc;
@@ -106,15 +101,15 @@ dacp_propget_playingtime(struct evbuffer *evbuf, struct player_status *status, s
 
 /* Forward - properties setters */
 static void
-dacp_propset_volume(const char *value, struct evkeyvalq *query);
+dacp_propset_volume(const char *value, struct keyval *query);
 static void
-dacp_propset_playingtime(const char *value, struct evkeyvalq *query);
+dacp_propset_playingtime(const char *value, struct keyval *query);
 static void
-dacp_propset_shufflestate(const char *value, struct evkeyvalq *query);
+dacp_propset_shufflestate(const char *value, struct keyval *query);
 static void
-dacp_propset_repeatstate(const char *value, struct evkeyvalq *query);
+dacp_propset_repeatstate(const char *value, struct keyval *query);
 static void
-dacp_propset_userrating(const char *value, struct evkeyvalq *query);
+dacp_propset_userrating(const char *value, struct keyval *query);
 
 
 /* gperf static hash, dacp_prop.gperf */
@@ -122,19 +117,14 @@ dacp_propset_userrating(const char *value, struct evkeyvalq *query);
 
 
 /* Play status update */
-#ifdef USE_EVENTFD
-static int update_efd;
-#else
-static int update_pipe[2];
-#endif
-static struct event updateev;
 static int current_rev;
-
-/* Play status update requests */
+static dispatch_queue_t updates_sq;
+static dispatch_source_t updates_src;
 static struct dacp_update_request *update_requests;
 
 /* Seek timer */
-static struct event seek_timer;
+static dispatch_queue_t seek_sq;
+static dispatch_source_t seek_timer;
 static int seek_target;
 
 
@@ -254,63 +244,85 @@ make_playstatusupdate(struct evbuffer *evbuf)
   return 0;
 }
 
+/* Queue: updates_sq */
 static void
-playstatusupdate_cb(int fd, short what, void *arg)
+playstatus_update_cb(void *arg)
 {
   struct dacp_update_request *ur;
   struct evbuffer *evbuf;
   struct evbuffer *update;
   int ret;
 
-#ifdef USE_EVENTFD
-  eventfd_t count;
-
-  ret = eventfd_read(update_efd, &count);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_DACP, "Could not read playstatusupdate event counter: %s\n", strerror(errno));
-
-      goto readd;
-    }
-#else
-  int dummy;
-
-  read(update_pipe[0], &dummy, sizeof(dummy));
-#endif
-
   if (!update_requests)
-    goto readd;
-
-  evbuf = evbuffer_new();
-  if (!evbuf)
     {
-      DPRINTF(E_LOG, L_DACP, "Could not allocate evbuffer for playstatusupdate reply\n");
-
-      goto readd;
+      DPRINTF(E_DBG, L_DACP, "Playstatus updates: no clients\n");
+      return;
     }
+  else
+    DPRINTF(E_DBG, L_DACP, "Playstatus updates: sending out updates\n");
 
   update = evbuffer_new();
   if (!update)
     {
       DPRINTF(E_LOG, L_DACP, "Could not allocate evbuffer for playstatusupdate data\n");
 
-      goto out_free_evbuf;
+      return;
+    }
+
+  ret = db_pool_get();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not acquire database connection; skipping playstatus update\n");
+
+      goto out_free_update;
     }
 
   ret = make_playstatusupdate(update);
+
+  db_pool_release();
+
   if (ret < 0)
     goto out_free_update;
 
   for (ur = update_requests; update_requests; ur = update_requests)
     {
+      evbuf = evbuffer_new();
+      if (!evbuf)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Could not allocate evbuffer for playstatusupdate reply\n");
+
+	  break;
+	}
+
+      ret = evbuffer_add(evbuf, EVBUFFER_DATA(update), EVBUFFER_LENGTH(update));
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Out of memory for playstatus update\n");
+
+	  evbuffer_free(evbuf);
+	  break;
+	}
+
+      ret = http_response_set_status(ur->r, HTTP_OK, "OK");
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Could not set response status for playstatus update\n");
+
+	  evbuffer_free(evbuf);
+	  break;
+	}
+
+      http_response_set_body(ur->r, evbuf);
+
+      ret = http_server_response_thaw_and_run(ur->c, ur->r);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Could not thaw and run response to playstatus update request\n");
+
+	  http_server_kill_connection(ur->c);
+	}
+
       update_requests = ur->next;
-
-      evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
-
-      evbuffer_add(evbuf, EVBUFFER_DATA(update), EVBUFFER_LENGTH(update));
-
-      httpd_send_reply(ur->req, HTTP_OK, "OK", evbuf);
-
       free(ur);
     }
 
@@ -318,35 +330,18 @@ playstatusupdate_cb(int fd, short what, void *arg)
 
  out_free_update:
   evbuffer_free(update);
- out_free_evbuf:
-  evbuffer_free(evbuf);
- readd:
-  ret = event_add(&updateev, NULL);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_DACP, "Couldn't re-add event for playstatusupdate\n");
 }
 
-/* Thread: player */
+/* Queue: player */
 static void
 dacp_playstatus_update_handler(void)
 {
-  int ret;
-
-#ifdef USE_EVENTFD
-  ret = eventfd_write(update_efd, 1);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_DACP, "Could not send status update event: %s\n", strerror(errno));
-#else
-  int dummy = 42;
-
-  ret = write(update_pipe[1], &dummy, sizeof(dummy));
-  if (ret != sizeof(dummy))
-    DPRINTF(E_LOG, L_DACP, "Could not write to status update fd: %s\n", strerror(errno));
-#endif
+  dispatch_source_merge_data(updates_src, 1);
 }
 
+/* Queue: updates_sq */
 static void
-update_fail_cb(struct evhttp_connection *evcon, void *arg)
+update_free_cb_task(void *arg)
 {
   struct dacp_update_request *ur;
   struct dacp_update_request *p;
@@ -354,9 +349,6 @@ update_fail_cb(struct evhttp_connection *evcon, void *arg)
   ur = (struct dacp_update_request *)arg;
 
   DPRINTF(E_DBG, L_DACP, "Update request: client closed connection\n");
-
-  if (ur->req->evcon)
-    evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
 
   if (ur == update_requests)
     update_requests = ur->next;
@@ -375,6 +367,14 @@ update_fail_cb(struct evhttp_connection *evcon, void *arg)
     }
 
   free(ur);
+}
+
+static void
+update_free_cb(void *data)
+{
+  DPRINTF(E_DBG, L_DACP, "Update request: connection closed\n");
+
+  dispatch_sync_f(updates_sq, data, update_free_cb_task);
 }
 
 
@@ -435,7 +435,7 @@ dacp_propget_playingtime(struct evbuffer *evbuf, struct player_status *status, s
 
 /* Properties setters */
 static void
-dacp_propset_volume(const char *value, struct evkeyvalq *query)
+dacp_propset_volume(const char *value, struct keyval *query)
 {
   const char *param;
   uint64_t id;
@@ -450,7 +450,7 @@ dacp_propset_volume(const char *value, struct evkeyvalq *query)
       return;
     }
 
-  param = evhttp_find_header(query, "speaker-id");
+  param = keyval_get(query, "speaker-id");
   if (param)
     {
       ret = safe_atou64(param, &id);
@@ -465,7 +465,7 @@ dacp_propset_volume(const char *value, struct evkeyvalq *query)
       return;
     }
 
-  param = evhttp_find_header(query, "include-speaker-id");
+  param = keyval_get(query, "include-speaker-id");
   if (param)
     {
       ret = safe_atou64(param, &id);
@@ -484,9 +484,13 @@ dacp_propset_volume(const char *value, struct evkeyvalq *query)
 }
 
 static void
-seek_timer_cb(int fd, short what, void *arg)
+seek_timer_cb(void *arg)
 {
   int ret;
+
+  dispatch_source_cancel(seek_timer);
+  dispatch_release(seek_timer);
+  seek_timer = NULL;
 
   DPRINTF(E_DBG, L_DACP, "Seek timer expired, target %d ms\n", seek_target);
 
@@ -504,15 +508,12 @@ seek_timer_cb(int fd, short what, void *arg)
 }
 
 static void
-dacp_propset_playingtime(const char *value, struct evkeyvalq *query)
+dacp_propset_playingtime(const char *value, struct keyval *query)
 {
-  struct timeval tv;
+  int target;
   int ret;
 
-  if (event_initialized(&seek_timer))
-    event_del(&seek_timer);
-
-  ret = safe_atoi32(value, &seek_target);
+  ret = safe_atoi32(value, &target);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DACP, "dacp.playingtime argument doesn't convert to integer: %s\n", value);
@@ -520,15 +521,34 @@ dacp_propset_playingtime(const char *value, struct evkeyvalq *query)
       return;
     }
 
-  evtimer_set(&seek_timer, seek_timer_cb, NULL);
-  event_base_set(evbase_httpd, &seek_timer);
-  evutil_timerclear(&tv);
-  tv.tv_usec = 200 * 1000;
-  evtimer_add(&seek_timer, &tv);
+  dispatch_async(seek_sq, ^{
+      if (!seek_timer)
+	{
+	  seek_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, seek_sq);
+	  if (!seek_timer)
+	    {
+	      DPRINTF(E_LOG, L_DACP, "Could not create dispatch source for seek timer\n");
+
+	      return;
+	    }
+
+	  dispatch_source_set_event_handler_f(seek_timer, seek_timer_cb);
+	}
+      else
+	dispatch_suspend(seek_timer);
+
+      dispatch_source_set_timer(seek_timer,
+				dispatch_time(DISPATCH_TIME_NOW, 200 * (NSEC_PER_SEC / 1000)),
+				DISPATCH_TIME_FOREVER /* one-shot */, 0);
+
+      seek_target = target;
+
+      dispatch_resume(seek_timer);
+    });
 }
 
 static void
-dacp_propset_shufflestate(const char *value, struct evkeyvalq *query)
+dacp_propset_shufflestate(const char *value, struct keyval *query)
 {
   int enable;
   int ret;
@@ -545,7 +565,7 @@ dacp_propset_shufflestate(const char *value, struct evkeyvalq *query)
 }
 
 static void
-dacp_propset_repeatstate(const char *value, struct evkeyvalq *query)
+dacp_propset_repeatstate(const char *value, struct keyval *query)
 {
   int mode;
   int ret;
@@ -562,7 +582,7 @@ dacp_propset_repeatstate(const char *value, struct evkeyvalq *query)
 }
 
 static void
-dacp_propset_userrating(const char *value, struct evkeyvalq *query)
+dacp_propset_userrating(const char *value, struct keyval *query)
 {
   struct media_file_info *mfi;
   const char *param;
@@ -578,7 +598,7 @@ dacp_propset_userrating(const char *value, struct evkeyvalq *query)
       return;
     }
 
-  param = evhttp_find_header(query, "item-spec");
+  param = keyval_get(query, "item-spec");
   if (!param)
     {
       DPRINTF(E_LOG, L_DACP, "Missing item-spec parameter in dacp.userrating query\n");
@@ -622,9 +642,11 @@ dacp_propset_userrating(const char *value, struct evkeyvalq *query)
 }
 
 
-static void
-dacp_reply_ctrlint(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_ctrlint(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
+  int ret;
+
   dmap_add_container(evbuf, "caci", 127); /* 8 + len */
   dmap_add_int(evbuf, "mstt", 200);       /* 12 */
   dmap_add_char(evbuf, "muty", 0);        /* 9 */
@@ -647,11 +669,19 @@ dacp_reply_ctrlint(struct evhttp_request *req, struct evbuffer *evbuf, char **ur
   dmap_add_char(evbuf, "ceSG", 1);        /* 9 */
   dmap_add_char(evbuf, "cmrl", 1);        /* 9 */
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      evbuffer_free(evbuf);
+
+      return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_cue_play(struct httpd_hdl *h, struct evbuffer *evbuf)
 {
   struct player_status status;
   struct player_source *ps;
@@ -664,7 +694,7 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 
   /* /cue?command=play&query=...&sort=...&index=N */
 
-  param = evhttp_find_header(query, "clear-first");
+  param = keyval_get(h->query, "clear-first");
   if (param)
     {
       ret = safe_atoi32(param, &clear);
@@ -678,18 +708,18 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 	}
     }
 
-  cuequery = evhttp_find_header(query, "query");
+  cuequery = keyval_get(h->query, "query");
   if (cuequery)
     {
-      sort = evhttp_find_header(query, "sort");
+      sort = keyval_get(h->query, "sort");
 
       ps = player_queue_make_daap(cuequery, sort);
       if (!ps)
 	{
 	  DPRINTF(E_LOG, L_DACP, "Could not build song queue\n");
 
-	  dmap_send_error(req, "cacr", "Could not build song queue");
-	  return;
+	  evbuffer_free(evbuf);
+	  return dmap_send_error(h, "cacr", "Could not build song queue");
 	}
 
       player_queue_add(ps);
@@ -702,12 +732,12 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 	player_playback_stop();
     }
 
-  param = evhttp_find_header(query, "dacp.shufflestate");
+  param = keyval_get(h->query, "dacp.shufflestate");
   if (param)
     dacp_propset_shufflestate(param, NULL);
 
   id = 0;
-  param = evhttp_find_header(query, "index");
+  param = keyval_get(h->query, "index");
   if (param)
     {
       ret = safe_atou32(param, &id);
@@ -720,20 +750,26 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Could not start playback\n");
 
-      dmap_send_error(req, "cacr", "Playback failed to start");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "cacr", "Playback failed to start");
     }
 
   dmap_add_container(evbuf, "cacr", 24); /* 8 + len */
   dmap_add_int(evbuf, "mstt", 200);      /* 12 */
   dmap_add_int(evbuf, "miid", id);       /* 12 */
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-dacp_reply_cue_clear(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_cue_clear(struct httpd_hdl *h, struct evbuffer *evbuf)
 {
+  int ret;
+
   /* /cue?command=clear */
 
   player_playback_stop();
@@ -744,43 +780,50 @@ dacp_reply_cue_clear(struct evhttp_request *req, struct evbuffer *evbuf, char **
   dmap_add_int(evbuf, "mstt", 200);      /* 12 */
   dmap_add_int(evbuf, "miid", 0);        /* 12 */
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 }
 
-static void
-dacp_reply_cue(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_cue(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   const char *param;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
-  param = evhttp_find_header(query, "command");
+  param = keyval_get(h->query, "command");
   if (!param)
     {
       DPRINTF(E_DBG, L_DACP, "No command in cue request\n");
 
-      dmap_send_error(req, "cacr", "No command in cue request");
-      return;
+      evbuffer_free(evbuf);
+      return dmap_send_error(h, "cacr", "No command in cue request");
     }
 
   if (strcmp(param, "clear") == 0)
-    dacp_reply_cue_clear(req, evbuf, uri, query);
+    return dacp_reply_cue_clear(h, evbuf);
   else if (strcmp(param, "play") == 0)
-    dacp_reply_cue_play(req, evbuf, uri, query);
-  else
-    {
-      DPRINTF(E_LOG, L_DACP, "Unknown cue command %s\n", param);
+    return dacp_reply_cue_play(h, evbuf);
 
-      dmap_send_error(req, "cacr", "Unknown command in cue request");
-      return;
-    }
+  DPRINTF(E_LOG, L_DACP, "Unknown cue command %s\n", param);
+
+  evbuffer_free(evbuf);
+
+  return dmap_send_error(h, "cacr", "Unknown command in cue request");
 }
 
-static void
-dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_playspec(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct player_status status;
   struct player_source *ps;
@@ -795,20 +838,22 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
    * With our DAAP implementation, container-spec is the playlist ID and container-item-spec is the song ID
    */
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   /* Check for shuffle */
-  shuffle = evhttp_find_header(query, "dacp.shufflestate");
+  shuffle = keyval_get(h->query, "dacp.shufflestate");
 
   /* Playlist ID */
-  param = evhttp_find_header(query, "container-spec");
+  param = keyval_get(h->query, "container-spec");
   if (!param)
     {
       DPRINTF(E_LOG, L_DACP, "No container-spec in playspec request\n");
 
-      goto out_fail;
+      goto out_error;
     }
 
   param = strchr(param, ':');
@@ -816,7 +861,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Malformed container-spec parameter in playspec request\n");
 
-      goto out_fail;
+      goto out_error;
     }
   param++;
 
@@ -825,18 +870,18 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Couldn't convert container-spec to an integer in playspec (%s)\n", param);
 
-      goto out_fail;
+      goto out_error;
     }
 
   if (!shuffle)
     {
       /* Start song ID */
-      param = evhttp_find_header(query, "container-item-spec");
+      param = keyval_get(h->query, "container-item-spec");
       if (!param)
 	{
 	  DPRINTF(E_LOG, L_DACP, "No container-item-spec in playspec request\n");
 
-	  goto out_fail;
+	  goto out_error;
 	}
 
       param = strchr(param, ':');
@@ -844,7 +889,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 	{
 	  DPRINTF(E_LOG, L_DACP, "Malformed container-item-spec parameter in playspec request\n");
 
-	  goto out_fail;
+	  goto out_error;
 	}
       param++;
 
@@ -853,7 +898,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 	{
 	  DPRINTF(E_LOG, L_DACP, "Couldn't convert container-item-spec to an integer in playspec (%s)\n", param);
 
-	  goto out_fail;
+	  goto out_error;
 	}
     }
   else
@@ -866,7 +911,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Could not build song queue from playlist %d\n", plid);
 
-      goto out_fail;
+      goto out_error;
     }
 
   DPRINTF(E_DBG, L_DACP, "Playspec start song index is %d\n", id);
@@ -888,72 +933,106 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Could not start playback\n");
 
-      goto out_fail;
+      goto out_error;
     }
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
-  return;
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
 
- out_fail:
-  evhttp_send_error(req, 500, "Internal Server Error");
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_pause(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
-{
-  struct daap_session *s;
-
-  s = daap_session_find(req, query, evbuf);
-  if (!s)
-    return;
-
-  player_playback_pause();
-
-  /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
-}
-
-static void
-dacp_reply_playpause(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_pause(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
+
+  player_playback_pause();
+
+  /* 204 No Content is the canonical reply */
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+}
+
+static int
+dacp_reply_playpause(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
+{
+  struct daap_session *s;
+  int ret;
+
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
+  if (!s)
+    return ret;
 
   ret = player_playback_start(NULL);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DACP, "Player returned an error for start after pause\n");
 
-      evhttp_send_error(req, 500, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_nextitem(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_nextitem(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   ret = player_playback_next();
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DACP, "Player returned an error for nextitem\n");
 
-      evhttp_send_error(req, 500, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   ret = player_playback_start(NULL);
@@ -961,31 +1040,42 @@ dacp_reply_nextitem(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Player returned an error for start after nextitem\n");
 
-      evhttp_send_error(req, 500, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_previtem(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_previtem(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   ret = player_playback_prev();
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DACP, "Player returned an error for previtem\n");
 
-      evhttp_send_error(req, 500, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   ret = player_playback_start(NULL);
@@ -993,61 +1083,111 @@ dacp_reply_previtem(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       DPRINTF(E_LOG, L_DACP, "Player returned an error for start after previtem\n");
 
-      evhttp_send_error(req, 500, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_beginff(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_beginff(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   /* TODO */
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_beginrew(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_beginrew(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   /* TODO */
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_playresume(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_playresume(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   /* TODO */
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_playstatusupdate(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_playstatusupdate(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   struct dacp_update_request *ur;
@@ -1055,17 +1195,19 @@ dacp_reply_playstatusupdate(struct evhttp_request *req, struct evbuffer *evbuf, 
   int reqd_rev;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
-  param = evhttp_find_header(query, "revision-number");
+  param = keyval_get(h->query, "revision-number");
   if (!param)
     {
       DPRINTF(E_LOG, L_DACP, "Missing revision-number in update request\n");
 
-      dmap_send_error(req, "cmst", "Invalid request");
-      return;
+      return dmap_send_error(h, "cmst", "Invalid request");
     }
 
   ret = safe_atoi32(param, &reqd_rev);
@@ -1073,44 +1215,57 @@ dacp_reply_playstatusupdate(struct evhttp_request *req, struct evbuffer *evbuf, 
     {
       DPRINTF(E_LOG, L_DACP, "Parameter revision-number not an integer\n");
 
-      dmap_send_error(req, "cmst", "Invalid request");
-      return;
+      return dmap_send_error(h, "cmst", "Invalid request");
     }
 
   if (reqd_rev == 1)
     {
       ret = make_playstatusupdate(evbuf);
       if (ret < 0)
-	evhttp_send_error(req, 500, "Internal Server Error");
-      else
-	httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+	{
+	  evbuffer_free(evbuf);
 
-      return;
+	  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+	}
+
+      ret = http_response_set_status(h->r, HTTP_OK, "OK");
+      if (ret < 0)
+	{
+	  evbuffer_free(evbuf);
+
+	  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+	}
+
+      return httpd_send_reply(h->c, h->req, h->r, evbuf);
     }
 
-  /* Else, just let the request hang until we have changes to push back */
+  evbuffer_free(evbuf);
+
   ur = (struct dacp_update_request *)malloc(sizeof(struct dacp_update_request));
   if (!ur)
     {
       DPRINTF(E_LOG, L_DACP, "Out of memory for update request\n");
 
-      dmap_send_error(req, "cmst", "Out of memory");
-      return;
+      return dmap_send_error(h, "cmst", "Out of memory");
     }
 
-  ur->req = req;
+  /* Freeze the request */
+  http_server_response_freeze(h->c, h->r, update_free_cb, ur);
 
-  ur->next = update_requests;
-  update_requests = ur;
+  ur->c = h->c;
+  ur->req = h->req;
+  ur->r = h->r;
 
-  /* If the connection fails before we have an update to push out
-   * to the client, we need to know.
-   */
-  evhttp_connection_set_closecb(req->evcon, update_fail_cb, ur);
+  dispatch_sync(updates_sq, ^{
+		  ur->next = update_requests;
+		  update_requests = ur;
+		});
+
+  return 0;
 }
 
-static void
-dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_nowplayingartwork(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   char clen[32];
   struct daap_session *s;
@@ -1121,17 +1276,19 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
   int max_h;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    {
+      evbuffer_free(evbuf);
+      return ret;
+    }
 
-  param = evhttp_find_header(query, "mw");
+  param = keyval_get(h->query, "mw");
   if (!param)
     {
       DPRINTF(E_LOG, L_DACP, "Request for artwork without mw parameter\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
   ret = safe_atoi32(param, &max_w);
@@ -1139,17 +1296,15 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
     {
       DPRINTF(E_LOG, L_DACP, "Could not convert mw parameter to integer\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
-  param = evhttp_find_header(query, "mh");
+  param = keyval_get(h->query, "mh");
   if (!param)
     {
       DPRINTF(E_LOG, L_DACP, "Request for artwork without mh parameter\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
   ret = safe_atoi32(param, &max_h);
@@ -1157,8 +1312,7 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
     {
       DPRINTF(E_LOG, L_DACP, "Could not convert mh parameter to integer\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      goto bad_request;
     }
 
   ret = player_now_playing(&id);
@@ -1177,27 +1331,46 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
 	break;
 
       default:
-	if (EVBUFFER_LENGTH(evbuf) > 0)
-	  evbuffer_drain(evbuf, EVBUFFER_LENGTH(evbuf));
-
 	goto no_artwork;
     }
 
-  evhttp_remove_header(req->output_headers, "Content-Type");
-  evhttp_add_header(req->output_headers, "Content-Type", ctype);
+  http_response_set_body(h->r, evbuf);
+
+  http_response_remove_header(h->r, "Content-Type");
+  ret = http_response_add_header(h->r, "Content-Type", ctype);
+  if (ret < 0)
+    goto out_error;
+
   snprintf(clen, sizeof(clen), "%ld", (long)EVBUFFER_LENGTH(evbuf));
-  evhttp_add_header(req->output_headers, "Content-Length", clen);
+  ret = http_response_add_header(h->r, "Content-Length", clen);
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    goto out_error;
 
   /* No gzip compression for artwork */
-  evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
-  return;
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ bad_request:
+  evbuffer_free(evbuf);
+  return http_server_error_run(h->c, h->r, HTTP_BAD_REQUEST, "Bad Request");
 
  no_artwork:
-  evhttp_send_error(req, HTTP_NOTFOUND, "Not Found");
+  evbuffer_free(evbuf);
+  return http_server_error_run(h->c, h->r, HTTP_NOT_FOUND, "Not Found");
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
-static void
-dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_getproperty(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct player_status status;
   struct daap_session *s;
@@ -1210,17 +1383,17 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
   char *propstr;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    goto out_free_evbuf;
 
-  param = evhttp_find_header(query, "properties");
+  param = keyval_get(h->query, "properties");
   if (!param)
     {
       DPRINTF(E_WARN, L_DACP, "Invalid DACP getproperty request, no properties\n");
 
-      dmap_send_error(req, "cmgt", "Invalid request");
-      return;
+      ret = dmap_send_error(h, "cmgt", "Invalid request");
+      goto out_free_evbuf;
     }
 
   propstr = strdup(param);
@@ -1228,8 +1401,8 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
     {
       DPRINTF(E_LOG, L_DACP, "Could not duplicate properties parameter; out of memory\n");
 
-      dmap_send_error(req, "cmgt", "Out of memory");
-      return;
+      ret = dmap_send_error(h, "cmgt", "Out of memory");
+      goto out_free_evbuf;
     }
 
   proplist = evbuffer_new();
@@ -1237,7 +1410,7 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
     {
       DPRINTF(E_LOG, L_DACP, "Could not allocate evbuffer for properties list\n");
 
-      dmap_send_error(req, "cmgt", "Out of memory");
+      ret = dmap_send_error(h, "cmgt", "Out of memory");
       goto out_free_propstr;
     }
 
@@ -1250,7 +1423,7 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
 	{
 	  DPRINTF(E_LOG, L_DACP, "Could not fetch file id %d\n", status.id);
 
-	  dmap_send_error(req, "cmgt", "Server error");
+	  ret = dmap_send_error(h, "cmgt", "Server error");
 	  goto out_free_proplist;
 	}
     }
@@ -1288,31 +1461,42 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
     {
       DPRINTF(E_LOG, L_DACP, "Could not add properties to getproperty reply\n");
 
-      dmap_send_error(req, "cmgt", "Out of memory");
-      return;
+      ret = dmap_send_error(h, "cmgt", "Out of memory");
+      goto out_free_evbuf;
     }
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      ret = dmap_send_error(h, "cmgt", "Server error");
+      goto out_free_evbuf;
+    }
 
-  return;
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
 
  out_free_proplist:
   evbuffer_free(proplist);
-
  out_free_propstr:
   free(propstr);
+ out_free_evbuf:
+  evbuffer_free(evbuf);
+
+  return ret;
 }
 
-static void
-dacp_reply_setproperty(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_setproperty(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   const struct dacp_prop_map *dpm;
-  struct evkeyval *param;
+  struct onekeyval *okv;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  evbuffer_free(evbuf);
+
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    return ret;
 
   /* Known properties:
    * dacp.shufflestate 0/1
@@ -1323,24 +1507,34 @@ dacp_reply_setproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
 
   /* /ctrl-int/1/setproperty?dacp.shufflestate=1&session-id=100 */
 
-  TAILQ_FOREACH(param, query, next)
+  for (okv = h->query->head; okv; okv = okv->next)
     {
-      dpm = dacp_find_prop(param->key, strlen(param->key));
-
+      dpm = dacp_find_prop(okv->name, strlen(okv->name));
       if (!dpm)
 	{
-	  DPRINTF(E_SPAM, L_DACP, "Unknown DACP property %s\n", param->key);
+	  DPRINTF(E_SPAM, L_DACP, "Unknown DACP property %s\n", okv->name);
 	  continue;
 	}
 
       if (dpm->propset)
-	dpm->propset(param->value, query);
+	dpm->propset(okv->value, h->query);
       else
 	DPRINTF(E_WARN, L_DACP, "No setter method for DACP property %s\n", dpm->desc);
     }
 
   /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+  if (ret < 0)
+    goto out_error;
+
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
 static void
@@ -1372,24 +1566,24 @@ speaker_enum_cb(uint64_t id, const char *name, int relvol, struct spk_flags flag
   dmap_add_int(evbuf, "cmvo", relvol);    /* 12 */
 }
 
-static void
-dacp_reply_getspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_getspeakers(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   struct evbuffer *spklist;
+  int ret;
 
-  s = daap_session_find(req, query, evbuf);
+  ret = daap_session_find(h, &s);
   if (!s)
-    return;
+    goto out;
 
   spklist = evbuffer_new();
   if (!spklist)
     {
       DPRINTF(E_LOG, L_DACP, "Could not create evbuffer for speaker list\n");
 
-      dmap_send_error(req, "casp", "Out of memory");
-
-      return;
+      ret = dmap_send_error(h, "casp", "Out of memory");
+      goto out;
     }
 
   player_speaker_enumerate(speaker_enum_cb, spklist);
@@ -1401,11 +1595,23 @@ dacp_reply_getspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
 
   evbuffer_free(spklist);
 
-  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+  ret = http_response_set_status(h->r, HTTP_OK, "OK");
+  if (ret < 0)
+    {
+      ret = dmap_send_error(h, "casp", "Server error");
+      goto out;
+    }
+
+  return httpd_send_reply(h->c, h->req, h->r, evbuf);
+
+ out:
+  evbuffer_free(evbuf);
+
+  return ret;
 }
 
-static void
-dacp_reply_setspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+static int
+dacp_reply_setspeakers(struct httpd_hdl *h, struct evbuffer *evbuf, char **uri)
 {
   struct daap_session *s;
   const char *param;
@@ -1415,17 +1621,18 @@ dacp_reply_setspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
   int i;
   int ret;
 
-  s = daap_session_find(req, query, evbuf);
-  if (!s)
-    return;
+  evbuffer_free(evbuf);
 
-  param = evhttp_find_header(query, "speaker-id");
+  ret = daap_session_find(h, &s);
+  if (!s)
+    return ret;
+
+  param = keyval_get(h->query, "speaker-id");
   if (!param)
     {
       DPRINTF(E_LOG, L_DACP, "Missing speaker-id parameter in DACP setspeakers request\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+      return http_server_error_run(h->c, h->r, HTTP_BAD_REQUEST, "Bad Request");
     }
 
   if (strlen(param) == 0)
@@ -1444,8 +1651,7 @@ dacp_reply_setspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
     {
       DPRINTF(E_LOG, L_DACP, "Out of memory for speaker ids\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-      return;
+      goto out_error;
     }
 
   param--;
@@ -1480,15 +1686,30 @@ dacp_reply_setspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
 
       /* Password problem */
       if (ret == -2)
-	evhttp_send_error(req, 902, "");
+	{
+	  ret = http_response_set_status(h->r, 902, "");
+	  if (ret < 0)
+	    goto out_error;
+	}
       else
-	evhttp_send_error(req, 500, "Internal Server Error");
-
-      return;
+	goto out_error;
+    }
+  else
+    {
+      /* 204 No Content is the canonical reply */
+      ret = http_response_set_status(h->r, HTTP_NO_CONTENT, "No Content");
+      if (ret < 0)
+	goto out_error;
     }
 
-  /* 204 No Content is the canonical reply */
-  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+  ret = http_server_response_run(h->c, h->r);
+  if (ret < 0)
+    goto out_error;
+
+  return 0;
+
+ out_error:
+  return http_server_error_run(h->c, h->r, HTTP_INTERNAL_ERROR, "Internal Server Error");
 }
 
 
@@ -1564,27 +1785,26 @@ static struct uri_map dacp_handlers[] =
     }
   };
 
-void
-dacp_request(struct evhttp_request *req)
+int
+dacp_request(struct http_connection *c, struct http_request *req, struct http_response *r)
 {
+  struct httpd_hdl hdl;
+  struct keyval query;
   char *full_uri;
   char *uri;
   char *ptr;
   char *uri_parts[7];
   struct evbuffer *evbuf;
-  struct evkeyvalq query;
   int handler;
   int ret;
   int i;
 
-  memset(&query, 0, sizeof(struct evkeyvalq));
+  memset(&query, 0, sizeof(struct keyval));
+  memset(&hdl, 0, sizeof(struct httpd_hdl));
 
   full_uri = httpd_fixup_uri(req);
   if (!full_uri)
-    {
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
-    }
+    return http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
 
   ptr = strchr(full_uri, '?');
   if (ptr)
@@ -1594,16 +1814,14 @@ dacp_request(struct evhttp_request *req)
   if (!uri)
     {
       free(full_uri);
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-      return;
+
+      return http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
     }
 
   if (ptr)
     *ptr = '?';
 
-  ptr = uri;
-  uri = evhttp_decode_uri(uri);
-  free(ptr);
+  http_decode_uri(uri, URI_DECODE_NORMAL);
 
   DPRINTF(E_DBG, L_DACP, "DACP request: %s\n", full_uri);
 
@@ -1622,11 +1840,8 @@ dacp_request(struct evhttp_request *req)
     {
       DPRINTF(E_LOG, L_DACP, "Unrecognized DACP request\n");
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-
-      free(uri);
-      free(full_uri);
-      return;
+      ret = http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
+      goto out;
     }
 
   /* DACP has no HTTP authentication - Remote is identified by its pairing-guid */
@@ -1643,41 +1858,81 @@ dacp_request(struct evhttp_request *req)
     {
       DPRINTF(E_LOG, L_DACP, "DACP URI has too many/few components (%d)\n", (uri_parts[0]) ? i : 0);
 
-      evhttp_send_error(req, HTTP_BADREQUEST, "Bad Request");
-
-      free(uri);
-      free(full_uri);
-      return;
+      ret = http_server_error_run(c, r, HTTP_BAD_REQUEST, "Bad Request");
+      goto out;
     }
 
+  ret = http_parse_query_string(full_uri, &query);
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out;
+    }
+
+  ret = http_response_add_header(r, "DAAP-Server", PACKAGE "/" VERSION);
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
+
+  /* Content-Type for all DACP replies; can be overriden as needed */
+  ret = http_response_add_header(r, "Content-Type", "application/x-dmap-tagged");
+  if (ret < 0)
+    {
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
+
+  /* Freed in the handler */
   evbuf = evbuffer_new();
   if (!evbuf)
     {
       DPRINTF(E_LOG, L_DACP, "Could not allocate evbuffer for DACP reply\n");
 
-      evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
-
-      free(uri);
-      free(full_uri);
-      return;
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
     }
 
-  evhttp_parse_query(full_uri, &query);
+  ret = db_pool_get();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not acquire database connection\n");
 
-  evhttp_add_header(req->output_headers, "DAAP-Server", "forked-daapd/" VERSION);
-  /* Content-Type for all DACP replies; can be overriden as needed */
-  evhttp_add_header(req->output_headers, "Content-Type", "application/x-dmap-tagged");
+      evbuffer_free(evbuf);
 
-  dacp_handlers[handler].handler(req, evbuf, uri_parts, &query);
+      ret = http_server_error_run(c, r, HTTP_INTERNAL_ERROR, "Internal Server Error");
+      goto out_clear_query;
+    }
 
-  evbuffer_free(evbuf);
-  evhttp_clear_headers(&query);
+  hdl.c = c;
+  hdl.req = req;
+  hdl.r = r;
+  hdl.query = &query;
+
+  /* Freeze playstatus updates to avoid sending out updates for
+   * transient statuses that could confuse Remote during DACP operations
+   */
+  dispatch_suspend(updates_src);
+
+  ret = dacp_handlers[handler].handler(&hdl, evbuf, uri_parts);
+
+  /* Thaw playstatus updates */
+  dispatch_resume(updates_src);
+
+  db_pool_release();
+
+ out_clear_query:
+  keyval_clear(&query);
+ out:
   free(uri);
   free(full_uri);
+
+  return ret;
 }
 
 int
-dacp_is_request(struct evhttp_request *req, char *uri)
+dacp_is_request(char *uri)
 {
   if (strncmp(uri, "/ctrl-int/", strlen("/ctrl-int/")) == 0)
     return 1;
@@ -1695,30 +1950,36 @@ dacp_init(void)
   int i;
   int ret;
 
+  seek_timer = NULL;
+
   current_rev = 2;
   update_requests = NULL;
 
-#ifdef USE_EVENTFD
-  update_efd = eventfd(0, EFD_CLOEXEC);
-  if (update_efd < 0)
+  updates_sq = dispatch_queue_create("org.forked-daapd.dacp.updates", NULL);
+  if (!updates_sq)
     {
-      DPRINTF(E_LOG, L_DACP, "Could not create update eventfd: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_DACP, "Could not create dispatch queue for DACP update requests\n");
 
       return -1;
     }
-#else
-# if defined(__linux__)
-  ret = pipe2(update_pipe, O_CLOEXEC);
-# else
-  ret = pipe(update_pipe);
-# endif
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_DACP, "Could not create update pipe: %s\n", strerror(errno));
 
-      return -1;
+  seek_sq = dispatch_queue_create("org.forked-daapd.dacp.seek", NULL);
+  if (!seek_sq)
+    {
+      DPRINTF(E_FATAL, L_DACP, "Could not create dispatch queue for DACP seek handling\n");
+
+      goto seek_sq_fail;
     }
-#endif /* USE_EVENTFD */
+
+  updates_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_ADD, 0, 0, updates_sq);
+  if (!updates_src)
+    {
+      DPRINTF(E_FATAL, L_DACP, "Could not create dispatch source for playstatus updates\n");
+
+      goto updates_src_fail;
+    }
+
+  dispatch_source_set_event_handler_f(updates_src, playstatus_update_cb);
 
   for (i = 0; dacp_handlers[i].handler; i++)
     {
@@ -1732,32 +1993,27 @@ dacp_init(void)
         }
     }
 
-#ifdef USE_EVENTFD
-  event_set(&updateev, update_efd, EV_READ, playstatusupdate_cb, NULL);
-#else
-  event_set(&updateev, update_pipe[0], EV_READ, playstatusupdate_cb, NULL);
-#endif
-  event_base_set(evbase_httpd, &updateev);
-  event_add(&updateev, NULL);
-
   player_set_update_handler(dacp_playstatus_update_handler);
+
+  dispatch_resume(updates_src);
 
   return 0;
 
  regexp_fail:
-#ifdef USE_EVENTFD
-  close(update_efd);
-#else
-  close(update_pipe[0]);
-  close(update_pipe[1]);
-#endif
+  dispatch_resume(updates_src);
+  dispatch_source_cancel(updates_src);
+  dispatch_release(updates_src);
+ updates_src_fail:
+  dispatch_release(seek_sq);
+ seek_sq_fail:
+  dispatch_release(updates_sq);
+
   return -1;
 }
 
 void
 dacp_deinit(void)
 {
-  struct dacp_update_request *ur;
   int i;
 
   player_set_update_handler(NULL);
@@ -1765,25 +2021,18 @@ dacp_deinit(void)
   for (i = 0; dacp_handlers[i].handler; i++)
     tre_regfree(&dacp_handlers[i].preg);
 
-  for (ur = update_requests; update_requests; ur = update_requests)
-    {
-      update_requests = ur->next;
+  dispatch_source_cancel(updates_src);
+  dispatch_release(updates_src);
+  dispatch_release(updates_sq);
 
-      if (ur->req->evcon)
-	{
-	  evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
-	  evhttp_connection_free(ur->req->evcon);
-	}
+  dispatch_sync(seek_sq, ^{
+      if (!seek_timer)
+	return;
 
-      free(ur);
-    }
+      dispatch_source_cancel(seek_timer);
+      dispatch_release(seek_timer);
+    });
+  dispatch_release(seek_sq);
 
-  event_del(&updateev);
-
-#ifdef USE_EVENTFD
-  close(update_efd);
-#else
-  close(update_pipe[0]);
-  close(update_pipe[1]);
-#endif
+  /* Pending update requests are removed during HTTP server shutdown */
 }

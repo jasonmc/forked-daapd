@@ -3,7 +3,8 @@
 #define __HTTPD_DACP_H__
 
 #include <event.h>
-#include "evhttp/evhttp.h"
+
+#include "http.h"
 
 int
 dacp_init(void);
@@ -11,10 +12,10 @@ dacp_init(void);
 void
 dacp_deinit(void);
 
-void
-dacp_request(struct evhttp_request *req);
+int
+dacp_request(struct http_connection *c, struct http_request *req, struct http_response *r);
 
 int
-dacp_is_request(struct evhttp_request *req, char *uri);
+dacp_is_request(char *uri);
 
 #endif /* !__HTTPD_DACP_H__ */
