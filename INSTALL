@@ -12,7 +12,7 @@ make; make install. Please read this file carefully before proceeding.
 
 System-specific requirements:
  - Linux:
-   + glibc 2.9+ (for signalfd)
+   + glibc 2.8+ (for timerfd)
    + libasound (ALSA sound support - or you can use OSS4)
  - FreeBSD:
    + OSS4 sound support
