@@ -37,8 +37,6 @@
 #include <grp.h>
 #include <stdint.h>
 
-#include <sys/eventfd.h>
-
 #include <pthread.h>
 
 #include <dispatch/dispatch.h>
@@ -87,10 +85,6 @@ typedef enum {
   SHUTDOWN_FAIL_FFMPEG,
 } shutdown_plan_t;
 
-
-struct event_base *evbase_main;
-static int exit_efd;
-static struct event exitev;
 
 static dispatch_source_t chld_src;
 static dispatch_source_t term_src;
@@ -340,14 +334,6 @@ register_services(char *ffid, int no_rsp, int no_daap)
   return 0;
 }
 
-static void
-exit_cb(int fd, short what, void *arg)
-{
-  event_base_loopbreak(evbase_main);
-
-  close(exit_efd);
-}
-
 
 static int
 ffmpeg_lockmgr(void **mutex, enum AVLockOp op)
@@ -399,7 +385,7 @@ main(int argc, char **argv)
   char *logfile;
   char *ffid;
   const char *gcry_version;
-  dispatch_queue_t global_q;
+  dispatch_queue_t main_q;
   shutdown_plan_t shutdown_plan;
   int ret;
 
@@ -594,7 +580,7 @@ main(int argc, char **argv)
   DPRINTF(E_DBG, L_MAIN, "Logger switched to dispatch mode\n");
 
   /* Initialize libevent (after forking) */
-  evbase_main = event_init();
+  event_init();
 
   DPRINTF(E_LOG, L_MAIN, "mDNS init\n");
   ret = mdns_init();
@@ -676,10 +662,10 @@ main(int argc, char **argv)
     }
 
   /* Set up signal dispatch sources */
-  global_q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-  if (!global_q)
+  main_q = dispatch_get_main_queue();
+  if (!main_q)
     {
-      DPRINTF(E_FATAL, L_MAIN, "Could not get global dispatch queue\n");
+      DPRINTF(E_FATAL, L_MAIN, "Could not get main dispatch queue\n");
 
       shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
       goto startup_fail;
@@ -687,7 +673,7 @@ main(int argc, char **argv)
 
   signal(SIGINT, SIG_IGN);
 
-  int_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, global_q);
+  int_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, main_q);
   if (!int_src)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGINT\n");
@@ -704,7 +690,7 @@ main(int argc, char **argv)
 
   signal(SIGTERM, SIG_IGN);
 
-  term_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, global_q);
+  term_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, main_q);
   if (!term_src)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGTERM\n");
@@ -721,7 +707,7 @@ main(int argc, char **argv)
 
   signal(SIGHUP, SIG_IGN);
 
-  hup_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGHUP, 0, global_q);
+  hup_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGHUP, 0, main_q);
   if (!hup_src)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGHUP\n");
@@ -740,7 +726,7 @@ main(int argc, char **argv)
 
   signal(SIGCHLD, SIG_IGN);
 
-  chld_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGCHLD, 0, global_q);
+  chld_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGCHLD, 0, main_q);
   if (!chld_src)
     {
       DPRINTF(E_FATAL, L_MAIN, "Could not create dispatch source for SIGCHLD\n");
@@ -760,23 +746,9 @@ main(int argc, char **argv)
 
   dispatch_resume(chld_src);
 
-  /* Temporary eventfd for main thread cleanup */
-  exit_efd = eventfd(0, EFD_CLOEXEC);
-  if (exit_efd < 0)
-    DPRINTF(E_FATAL, L_MAIN, "Could not create eventfd: %s\n", strerror(errno));
-  else
-    {
-      event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
-      event_base_set(evbase_main, &exitev);
-      event_add(&exitev, NULL);
-    }
-
-  /* Run the loop */
-  event_base_dispatch(evbase_main);
-
-  /* Temporary main thread cleanup */
   db_perthread_deinit();
-  pthread_exit(NULL);
+
+  dispatch_main();
 
  startup_fail:
   app_shutdown(shutdown_plan);
@@ -903,12 +875,6 @@ app_shutdown(shutdown_plan_t plan)
 	logger_deinit();
 
 	break;
-    }
-
-  if (ret == EXIT_SUCCESS)
-    {
-      /* Main thread cleanup */
-      eventfd_write(exit_efd, 1);
     }
 
   exit(ret);
