@@ -352,25 +352,30 @@ exit_cb(int fd, short what, void *arg)
 static int
 ffmpeg_lockmgr(void **mutex, enum AVLockOp op)
 {
+  dispatch_semaphore_t dsem;
+
+  dsem = (dispatch_semaphore_t)*mutex;
+
   switch (op)
     {
       case AV_LOCK_CREATE:
-	*mutex = malloc(sizeof(pthread_mutex_t));
-	if (!*mutex)
+	dsem = dispatch_semaphore_create(1);
+	if (!dsem)
 	  return 1;
 
-	return !!pthread_mutex_init(*mutex, NULL);
+	*mutex = dsem;
+	return 0;
 
       case AV_LOCK_OBTAIN:
-	return !!pthread_mutex_lock(*mutex);
+	dispatch_semaphore_wait(dsem, DISPATCH_TIME_FOREVER);
+	return 0;
 
       case AV_LOCK_RELEASE:
-	return !!pthread_mutex_unlock(*mutex);
+	dispatch_semaphore_signal(dsem);
+	return 0;
 
       case AV_LOCK_DESTROY:
-	pthread_mutex_destroy(*mutex);
-	free(*mutex);
-
+	dispatch_release(dsem);
 	return 0;
     }
 
