@@ -2,9 +2,6 @@
 #ifndef __RAOP_H__
 #define __RAOP_H__
 
-#include <event.h>
-#include "evrtsp/evrtsp.h"
-
 
 enum raop_devtype {
   RAOP_DEV_APEX_80211G,

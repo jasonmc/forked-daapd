@@ -58,7 +58,7 @@
 #include <net/if.h>
 
 #include <event.h>
-#include "evrtsp/evrtsp.h"
+#include <dispatch/dispatch.h>
 
 #include <gcrypt.h>
 
@@ -70,6 +70,7 @@
 #include "artwork.h"
 #include "dmap_common.h"
 #include "network.h"
+#include "http.h"
 #include "raop.h"
 
 #ifndef MIN
@@ -99,7 +100,7 @@ struct raop_v2_packet
 
 struct raop_session
 {
-  struct evrtsp_connection *ctrl;
+  struct http_connection *ctrl;
 
   enum raop_session_state state;
   unsigned req_has_auth:1;
@@ -159,16 +160,8 @@ struct raop_service
 {
   int fd;
   unsigned short port;
-  struct event ev;
+  dispatch_source_t source;
 };
-
-struct raop_deferred_eh
-{
-  struct event ev;
-  struct raop_session *session;
-};
-
-typedef void (*evrtsp_req_cb)(struct evrtsp_request *req, void *arg);
 
 /* Truncate RTP time to lower 32bits for RAOP */
 #define RAOP_RTPTIME(x) ((uint32_t)((x) & (uint64_t)0xffffffff))
@@ -206,7 +199,7 @@ static const uint8_t raop_rsa_exp[] = "\x01\x00\x01";
 
 
 /* From player.c */
-extern struct event_base *evbase_player;
+extern dispatch_queue_t player_sq;
 
 /* RAOP AES stream key */
 static uint8_t raop_aes_key[16];
@@ -240,7 +233,7 @@ static struct raop_metadata *metadata_head;
 static struct raop_metadata *metadata_tail;
 
 /* FLUSH timer */
-static struct event flush_timer;
+static dispatch_source_t flush_timer_src;
 
 /* Sessions */
 static struct raop_session *sessions;
@@ -760,12 +753,20 @@ raop_metadata_prepare(int id, uint64_t rtptime)
   uint64_t duration;
   int ret;
 
+  ret = db_pool_get();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not acquire database connection; cannot get metadata\n");
+
+      return NULL;
+    }
+
   rmd = (struct raop_metadata *)malloc(sizeof(struct raop_metadata));
   if (!rmd)
     {
       DPRINTF(E_LOG, L_RAOP, "Out of memory for RAOP metadata\n");
 
-      return NULL;
+      goto out_db;
     }
 
   memset(rmd, 0, sizeof(struct raop_metadata));
@@ -863,6 +864,8 @@ raop_metadata_prepare(int id, uint64_t rtptime)
  skip_artwork:
   db_query_end(&qp);
 
+  db_pool_release();
+
   /* Add rmd to metadata list */
   if (metadata_tail)
     metadata_tail->next = rmd;
@@ -880,6 +883,8 @@ raop_metadata_prepare(int id, uint64_t rtptime)
   db_query_end(&qp);
  out_rmd:
   free(rmd);
+ out_db:
+  db_pool_release();
 
   return NULL;
 }
@@ -887,7 +892,7 @@ raop_metadata_prepare(int id, uint64_t rtptime)
 
 /* Helpers */
 static int
-raop_add_auth(struct raop_session *rs, struct evrtsp_request *req, const char *method, const char *uri)
+raop_add_auth(struct raop_session *rs, struct http_request *req, const char *method, const char *uri)
 {
   char ha1[33];
   char ha2[33];
@@ -1009,7 +1014,7 @@ raop_add_auth(struct raop_session *rs, struct evrtsp_request *req, const char *m
       return -1;
     }
 
-  evrtsp_add_header(req->output_headers, "Authorization", auth);
+  http_request_add_header(req, "Authorization", auth);
 
   DPRINTF(E_DBG, L_RAOP, "Authorization header: %s\n", auth);
 
@@ -1019,7 +1024,7 @@ raop_add_auth(struct raop_session *rs, struct evrtsp_request *req, const char *m
 }
 
 static int
-raop_parse_auth(struct raop_session *rs, struct evrtsp_request *req)
+raop_parse_auth(struct raop_session *rs, struct http_response *r)
 {
   const char *param;
   char *auth;
@@ -1038,7 +1043,7 @@ raop_parse_auth(struct raop_session *rs, struct evrtsp_request *req)
       rs->nonce = NULL;
     }
 
-  param = evrtsp_find_header(req->input_headers, "WWW-Authenticate");
+  param = http_response_get_header(r, "WWW-Authenticate");
   if (!param)
     {
       DPRINTF(E_LOG, L_RAOP, "WWW-Authenticate header not found\n");
@@ -1116,26 +1121,26 @@ raop_parse_auth(struct raop_session *rs, struct evrtsp_request *req)
 }
 
 static int
-raop_add_headers(struct raop_session *rs, struct evrtsp_request *req, enum evrtsp_cmd_type req_method)
+raop_add_headers(struct raop_session *rs, struct http_request *req, enum request_method req_method)
 {
   char buf[64];
   const char *method;
   const char *url;
   int ret;
 
-  method = evrtsp_method(req_method);
+  method = http_method(req_method);
 
   DPRINTF(E_DBG, L_RAOP, "Building %s for %s\n", method, rs->devname);
 
   snprintf(buf, sizeof(buf), "%d", rs->cseq);
-  evrtsp_add_header(req->output_headers, "CSeq", buf);
+  http_request_add_header(req, "CSeq", buf);
 
   rs->cseq++;
 
-  evrtsp_add_header(req->output_headers, "User-Agent", "forked-daapd/" VERSION);
+  http_request_add_header(req, "User-Agent", "forked-daapd/" VERSION);
 
   /* Add Authorization header */
-  url = (req_method == EVRTSP_REQ_OPTIONS) ? "*" : rs->session_url;
+  url = (req_method == RTSP_OPTIONS) ? "*" : rs->session_url;
 
   ret = raop_add_auth(rs, req, method, url);
   if (ret < 0)
@@ -1149,57 +1154,54 @@ raop_add_headers(struct raop_session *rs, struct evrtsp_request *req, enum evrts
     }
 
   snprintf(buf, sizeof(buf), "%" PRIX64, libhash);
-  evrtsp_add_header(req->output_headers, "Client-Instance", buf);
-  evrtsp_add_header(req->output_headers, "DACP-ID", buf);
+  http_request_add_header(req, "Client-Instance", buf);
+  http_request_add_header(req, "DACP-ID", buf);
 
   if (rs->session)
-    evrtsp_add_header(req->output_headers, "Session", rs->session);
+    http_request_add_header(req, "Session", rs->session);
 
-  /* Content-Length added automatically by evrtsp */
-
+  /* Content-Length added automatically by gcd-http */
   return 0;
 }
 
 static int
-raop_grab_cseq(struct evkeyvalq *headers)
+raop_check_cseq(struct raop_session *rs, struct http_request *req, struct http_response *r)
 {
   const char *param;
-  int cseq;
-  int ret;
-
-  param = evrtsp_find_header(headers, "CSeq");
-  if (!param)
-    return -1;
-
-  ret = safe_atoi32(param, &cseq);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not convert CSeq value to integer (%s)\n", param);
-
-      return -1;
-    }
-
-  return cseq;
-}
-
-static int
-raop_check_cseq(struct raop_session *rs, struct evrtsp_request *req)
-{
   int reply_cseq;
   int request_cseq;
+  int ret;
 
-  reply_cseq = raop_grab_cseq(req->input_headers);
-  if (reply_cseq < 0)
+  /* Reply CSeq */
+  param = http_response_get_header(r, "CSeq");
+  if (!param)
     {
       DPRINTF(E_LOG, L_RAOP, "No CSeq in reply\n");
 
       return -1;
     }
 
-  request_cseq = raop_grab_cseq(req->output_headers);
-  if (request_cseq < 0)
+  ret = safe_atoi32(param, &reply_cseq);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not convert reply CSeq value to integer (%s)\n", param);
+
+      return -1;
+    }
+
+  /* Request CSeq */
+  param = http_request_get_header(req, "CSeq");
+  if (!param)
     {
       DPRINTF(E_LOG, L_RAOP, "No CSeq in request\n");
+
+      return -1;
+    }
+
+  ret = safe_atoi32(param, &request_cseq);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not convert request CSeq value to integer (%s)\n", param);
 
       return -1;
     }
@@ -1213,7 +1215,7 @@ raop_check_cseq(struct raop_session *rs, struct evrtsp_request *req)
 }
 
 static int
-raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address, uint32_t session_id)
+raop_make_sdp(struct raop_session *rs, struct http_request *req, char *address, uint32_t session_id)
 {
 #define SDP_PLD_FMT							\
   "v=0\r\n"								\
@@ -1227,15 +1229,24 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
     "a=rsaaeskey:%s\r\n"						\
     "a=aesiv:%s\r\n"
 
+  struct evbuffer *evbuf;
   char *p;
   int ret;
+
+  evbuf = evbuffer_new();
+  if (!evbuf)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create evbuffer for SDP payload\n");
+
+      return -1;
+    }
 
   p = strchr(rs->address, '%');
   if (p)
     *p = '\0';
 
   /* Add SDP payload */
-  ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
+  ret = evbuffer_add_printf(evbuf, SDP_PLD_FMT,
 			    session_id, address, rs->address, AIRTUNES_V2_PACKET_SAMPLES,
 			    raop_aes_key_b64, raop_aes_iv_b64);
 
@@ -1246,8 +1257,11 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
     {
       DPRINTF(E_LOG, L_RAOP, "Out of memory for SDP payload\n");
 
+      evbuffer_free(evbuf);
       return -1;
     }
+
+  http_request_set_body(req, evbuf);
 
   return 0;
 
@@ -1256,40 +1270,13 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
 
 
 /* RAOP/RTSP requests */
-/*
- * Request queueing HOWTO
- *
- * Sending:
- * - increment rs->reqs_in_flight
- * - set evrtsp connection closecb to NULL
- *
- * Request callback:
- * - decrement rs->reqs_in_flight first thing, even if the callback is
- *   called for error handling (req == NULL or HTTP error code)
- * - if rs->reqs_in_flight == 0, setup evrtsp connection closecb
- *
- * When a request fails, the whole RAOP session is declared failed and
- * torn down by calling raop_session_failure(), even if there are requests
- * queued on the evrtsp connection. There is no reason to think pending
- * requests would work out better than the one that just failed and recovery
- * would be tricky to get right.
- *
- * evrtsp behaviour with queued requests:
- * - request callback is called with req == NULL to indicate a connection
- *   error; if there are several requests queued on the connection, this can
- *   happen for each request if the connection isn't destroyed
- * - the connection is reset, and the closecb is called if the connection was
- *   previously connected. There is no closecb set when there are requests in
- *   flight
- */
-
 static int
-raop_send_req_teardown(struct raop_session *rs, evrtsp_req_cb cb)
+raop_send_req_teardown(struct raop_session *rs, http_cb cb)
 {
-  struct evrtsp_request *req;
+  struct http_request *req;
   int ret;
 
-  req = evrtsp_request_new(cb, rs);
+  req = http_client_request_new(RTSP_TEARDOWN, P_VER_1_0, rs->session_url, cb);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for TEARDOWN\n");
@@ -1297,36 +1284,35 @@ raop_send_req_teardown(struct raop_session *rs, evrtsp_req_cb cb)
       return -1;
     }
 
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_TEARDOWN);
+  ret = raop_add_headers(rs, req, RTSP_TEARDOWN);
   if (ret < 0)
     {
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_TEARDOWN, rs->session_url);
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not make TEARDOWN request\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not run TEARDOWN request\n");
 
+      http_request_free(req);
       return -1;
     }
 
   rs->reqs_in_flight++;
 
-  evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
-
   return 0;
 }
 
 static int
-raop_send_req_flush(struct raop_session *rs, uint64_t rtptime, evrtsp_req_cb cb)
+raop_send_req_flush(struct raop_session *rs, uint64_t rtptime, http_cb cb)
 {
   char buf[64];
-  struct evrtsp_request *req;
+  struct http_request *req;
   int ret;
 
-  req = evrtsp_request_new(cb, rs);
+  req = http_client_request_new(RTSP_FLUSH, P_VER_1_0, rs->session_url, cb);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for FLUSH\n");
@@ -1334,10 +1320,10 @@ raop_send_req_flush(struct raop_session *rs, uint64_t rtptime, evrtsp_req_cb cb)
       return -1;
     }
 
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_FLUSH);
+  ret = raop_add_headers(rs, req, RTSP_FLUSH);
   if (ret < 0)
     {
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
 
@@ -1347,84 +1333,75 @@ raop_send_req_flush(struct raop_session *rs, uint64_t rtptime, evrtsp_req_cb cb)
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in FLUSH request\n");
 
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
-  evrtsp_add_header(req->output_headers, "RTP-Info", buf);
+  http_request_add_header(req, "RTP-Info", buf);
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_FLUSH, rs->session_url);
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not make FLUSH request\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not run FLUSH request\n");
 
+      http_request_free(req);
       return -1;
     }
 
   rs->reqs_in_flight++;
 
-  evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
-
   return 0;
 }
 
 static int
-raop_send_req_set_parameter(struct raop_session *rs, struct evbuffer *evbuf, char *ctype, char *rtpinfo, evrtsp_req_cb cb)
+raop_send_req_set_parameter(struct raop_session *rs, struct evbuffer *evbuf, char *ctype, char *rtpinfo, http_cb cb)
 {
-  struct evrtsp_request *req;
+  struct http_request *req;
   int ret;
 
-  req = evrtsp_request_new(cb, rs);
+  req = http_client_request_new(RTSP_SET_PARAMETER, P_VER_1_0, rs->session_url, cb);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SET_PARAMETER\n");
 
+      evbuffer_free(evbuf);
       return -1;
     }
 
-  ret = evbuffer_add_buffer(req->output_buffer, evbuf);
+  http_request_set_body(req, evbuf);
+
+  ret = raop_add_headers(rs, req, RTSP_SET_PARAMETER);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Out of memory for SET_PARAMETER payload\n");
-
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
-
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_SET_PARAMETER);
-  if (ret < 0)
-    {
-      evrtsp_request_free(req);
-      return -1;
-    }
-
-  evrtsp_add_header(req->output_headers, "Content-Type", ctype);
+  http_request_add_header(req, "Content-Type", ctype);
 
   if (rtpinfo)
-    evrtsp_add_header(req->output_headers, "RTP-Info", rtpinfo);
+    http_request_add_header(req, "RTP-Info", rtpinfo);
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SET_PARAMETER, rs->session_url);
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not make SET_PARAMETER request\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not run SET_PARAMETER request\n");
 
+      http_request_free(req);
       return -1;
     }
 
   rs->reqs_in_flight++;
 
-  evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
-
   return 0;
 }
 
 static int
-raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb)
+raop_send_req_record(struct raop_session *rs, http_cb cb)
 {
   char buf[64];
-  struct evrtsp_request *req;
+  struct http_request *req;
   int ret;
 
-  req = evrtsp_request_new(cb, rs);
+  req = http_client_request_new(RTSP_RECORD, P_VER_1_0, rs->session_url, cb);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for RECORD\n");
@@ -1432,14 +1409,14 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb)
       return -1;
     }
 
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_RECORD);
+  ret = raop_add_headers(rs, req, RTSP_RECORD);
   if (ret < 0)
     {
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
 
-  evrtsp_add_header(req->output_headers, "Range", "npt=0-");
+  http_request_add_header(req, "Range", "npt=0-");
 
   /* Start sequence: next sequence */
   ret = snprintf(buf, sizeof(buf), "seq=%u;rtptime=%u", stream_seq + 1, RAOP_RTPTIME(rs->start_rtptime));
@@ -1447,16 +1424,17 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb)
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
 
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
-  evrtsp_add_header(req->output_headers, "RTP-Info", buf);
+  http_request_add_header(req, "RTP-Info", buf);
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_RECORD, rs->session_url);
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not make RECORD request\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not run RECORD request\n");
 
+      http_request_free(req);
       return -1;
     }
 
@@ -1466,13 +1444,13 @@ raop_send_req_record(struct raop_session *rs, evrtsp_req_cb cb)
 }
 
 static int
-raop_send_req_setup(struct raop_session *rs, evrtsp_req_cb cb)
+raop_send_req_setup(struct raop_session *rs, http_cb cb)
 {
   char hdr[128];
-  struct evrtsp_request *req;
+  struct http_request *req;
   int ret;
 
-  req = evrtsp_request_new(cb, rs);
+  req = http_client_request_new(RTSP_SETUP, P_VER_1_0, rs->session_url, cb);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SETUP\n");
@@ -1480,10 +1458,10 @@ raop_send_req_setup(struct raop_session *rs, evrtsp_req_cb cb)
       return -1;
     }
 
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_SETUP);
+  ret = raop_add_headers(rs, req, RTSP_SETUP);
   if (ret < 0)
     {
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
 
@@ -1494,17 +1472,18 @@ raop_send_req_setup(struct raop_session *rs, evrtsp_req_cb cb)
     {
       DPRINTF(E_LOG, L_RAOP, "Transport header exceeds buffer length\n");
 
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
 
-  evrtsp_add_header(req->output_headers, "Transport", hdr);
+  http_request_add_header(req, "Transport", hdr);
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SETUP, rs->session_url);
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not make SETUP request\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not run SETUP request\n");
 
+      http_request_free(req);
       return -1;
     }
 
@@ -1514,26 +1493,22 @@ raop_send_req_setup(struct raop_session *rs, evrtsp_req_cb cb)
 }
 
 static int
-raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
+raop_send_req_announce(struct raop_session *rs, http_cb cb)
 {
+  char address[NCONN_ADDRSTRLEN];
   uint8_t challenge[16];
   char *challenge_b64;
   char *ptr;
-  struct evrtsp_request *req;
-  char *address;
+  struct http_request *req;
   char *intf;
-  unsigned short port;
   uint32_t session_id;
   int ret;
 
   /* Determine local address, needed for SDP and session URL */
-  evrtsp_connection_get_local_address(rs->ctrl, &address, &port);
-  if (!address || (port == 0))
+  ret = http_connection_get_local_addr(rs->ctrl, address);
+  if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not determine local address\n");
-
-      if (address)
-	free(address);
 
       return -1;
     }
@@ -1545,16 +1520,7 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
       intf++;
     }
 
-  DPRINTF(E_DBG, L_RAOP, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
-
-  req = evrtsp_request_new(cb, rs);
-  if (!req)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for ANNOUNCE\n");
-
-      free(address);
-      return -1;
-    }
+  DPRINTF(E_DBG, L_RAOP, "Local address: %s (LL: %s)\n", address, (intf) ? intf : "no");
 
   /* Session ID and session URL */
   gcry_randomize(&session_id, sizeof(session_id), GCRY_STRONG_RANDOM);
@@ -1564,13 +1530,19 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
     {
       DPRINTF(E_LOG, L_RAOP, "Session URL length exceeds 127 characters\n");
 
-      free(address);
-      goto cleanup_req;
+      return -1;
+    }
+
+  req = http_client_request_new(RTSP_ANNOUNCE, P_VER_1_0, rs->session_url, cb);
+  if (!req)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for ANNOUNCE\n");
+
+      return -1;
     }
 
   /* SDP payload */
   ret = raop_make_sdp(rs, req, address, session_id);
-  free(address);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not generate SDP payload for ANNOUNCE\n");
@@ -1578,14 +1550,11 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
       goto cleanup_req;
     }
 
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_ANNOUNCE);
+  ret = raop_add_headers(rs, req, RTSP_ANNOUNCE);
   if (ret < 0)
-    {
-      evrtsp_request_free(req);
-      return -1;
-    }
+    goto cleanup_req;
 
-  evrtsp_add_header(req->output_headers, "Content-Type", "application/sdp");
+  http_request_add_header(req, "Content-Type", "application/sdp");
 
   /* Challenge */
   gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
@@ -1602,16 +1571,16 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
   if (ptr)
     *ptr = '\0';
 
-  evrtsp_add_header(req->output_headers, "Apple-Challenge", challenge_b64);
+  http_request_add_header(req, "Apple-Challenge", challenge_b64);
 
   free(challenge_b64);
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_ANNOUNCE, rs->session_url);
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Could not make ANNOUNCE request\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not run ANNOUNCE request\n");
 
-      return -1;
+      goto cleanup_req;
     }
 
   rs->reqs_in_flight++;
@@ -1619,18 +1588,18 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
   return 0;
 
  cleanup_req:
-  evrtsp_request_free(req);
+  http_request_free(req);
 
   return -1;
 }
 
 static int
-raop_send_req_options(struct raop_session *rs, evrtsp_req_cb cb)
+raop_send_req_options(struct raop_session *rs, http_cb cb)
 {
-  struct evrtsp_request *req;
+  struct http_request *req;
   int ret;
 
-  req = evrtsp_request_new(cb, rs);
+  req = http_client_request_new(RTSP_OPTIONS, P_VER_1_0, "*", cb);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for OPTIONS\n");
@@ -1638,24 +1607,23 @@ raop_send_req_options(struct raop_session *rs, evrtsp_req_cb cb)
       return -1;
     }
 
-  ret = raop_add_headers(rs, req, EVRTSP_REQ_OPTIONS);
+  ret = raop_add_headers(rs, req, RTSP_OPTIONS);
   if (ret < 0)
     {
-      evrtsp_request_free(req);
+      http_request_free(req);
       return -1;
     }
 
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_OPTIONS, "*");
+  ret = http_client_request_run(rs->ctrl, req);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not make OPTIONS request\n");
 
+      http_request_free(req);
       return -1;
     }
 
   rs->reqs_in_flight++;
-
-  evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
 
   return 0;
 }
@@ -1663,10 +1631,6 @@ raop_send_req_options(struct raop_session *rs, evrtsp_req_cb cb)
 static void
 raop_session_free(struct raop_session *rs)
 {
-  evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
-
-  evrtsp_connection_free(rs->ctrl);
-
   close(rs->server_fd);
 
   if (rs->realm)
@@ -1686,10 +1650,21 @@ raop_session_free(struct raop_session *rs)
 }
 
 static void
+raop_pktbuf_free_task(void *arg)
+{
+  struct raop_v2_packet *pkt;
+
+  pkt = (struct raop_v2_packet *)arg;
+
+  for (; pkt; pkt = pkt->next)
+    free(pkt);
+}
+
+static void
 raop_session_cleanup(struct raop_session *rs)
 {
   struct raop_session *s;
-  struct raop_v2_packet *pkt;
+  dispatch_queue_t global_q;
 
   if (rs == sessions)
     sessions = sessions->next;
@@ -1704,13 +1679,14 @@ raop_session_cleanup(struct raop_session *rs)
 	s->next = rs->next;
     }
 
-  raop_session_free(rs);
+  /* free_cb takes care of rs */
+  http_client_free(rs->ctrl);
 
   /* No more active sessions, free retransmit buffer */
   if (!sessions)
     {
-      for (pkt = pktbuf_head; pkt; pkt = pkt->next)
-	free(pkt);
+      global_q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+      dispatch_async_f(global_q, pktbuf_head, raop_pktbuf_free_task);
 
       pktbuf_head = NULL;
       pktbuf_tail = NULL;
@@ -1730,49 +1706,27 @@ raop_session_failure(struct raop_session *rs)
 }
 
 static void
-raop_deferred_eh_cb(int fd, short what, void *arg)
+raop_rtsp_free_cb(void *data)
 {
-  struct raop_deferred_eh *deh;
   struct raop_session *rs;
 
-  deh = (struct raop_deferred_eh *)arg;
+  rs = (struct raop_session *)data;
 
-  rs = deh->session;
-
-  free(deh);
-
-  DPRINTF(E_DBG, L_RAOP, "Cleaning up failed session (deferred) on device %s\n", rs->devname);
-
-  raop_session_failure(rs);
+  raop_session_free(rs);
 }
 
 static void
-raop_rtsp_close_cb(struct evrtsp_connection *evcon, void *arg)
+raop_rtsp_fail_cb(struct http_connection *c, void *data)
 {
-  struct timeval tv;
-  struct raop_deferred_eh *deh;
   struct raop_session *rs;
 
-  rs = (struct raop_session *)arg;
+  rs = (struct raop_session *)data;
 
   DPRINTF(E_LOG, L_RAOP, "ApEx %s closed RTSP connection\n", rs->devname);
 
   rs->state = RAOP_FAILED;
 
-  deh = (struct raop_deferred_eh *)malloc(sizeof(struct raop_deferred_eh));
-  if (!deh)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Out of memory for deferred error handling!\n");
-
-      return;
-    }
-
-  deh->session = rs;
-
-  evtimer_set(&deh->ev, raop_deferred_eh_cb, deh);
-  event_base_set(evbase_player, &deh->ev);
-  evutil_timerclear(&tv);
-  evtimer_add(&deh->ev, &tv);
+  raop_session_failure(rs);
 }
 
 static struct raop_session *
@@ -1847,15 +1801,17 @@ raop_session_make(struct raop_device *rd, int family, raop_status_cb cb)
 	break;
     }
 
-  rs->ctrl = evrtsp_connection_new(address, port);
+  rs->devname = strdup(rd->name);
+
+  rs->ctrl = http_client_new(L_RAOP, address, port, raop_rtsp_fail_cb, raop_rtsp_free_cb, rs);
   if (!rs->ctrl)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create control connection to %s\n", address);
 
-      goto out_free_rs;
+      free(rs->devname);
+      free(rs);
+      return NULL;
     }
-
-  evrtsp_connection_set_base(rs->ctrl, evbase_player);
 
   rs->sa.ss.ss_family = family;
   switch (family)
@@ -1904,10 +1860,11 @@ raop_session_make(struct raop_device *rd, int family, raop_status_cb cb)
     {
       DPRINTF(E_LOG, L_RAOP, "Device address not valid (%s)\n", address);
 
-      goto out_free_evcon;
+      /* free_cb takes care of rs */
+      http_client_free(rs->ctrl);
+      return NULL;
     }
 
-  rs->devname = strdup(rd->name);
   rs->address = strdup(address);
 
   rs->volume = rd->volume;
@@ -1916,67 +1873,67 @@ raop_session_make(struct raop_device *rd, int family, raop_status_cb cb)
   sessions = rs;
 
   return rs;
-
- out_free_evcon:
-  evrtsp_connection_free(rs->ctrl);
- out_free_rs:
-  free(rs);
-
-  return NULL;
 }
 
-static void
-raop_session_failure_cb(struct evrtsp_request *req, void *arg)
+static int
+raop_session_failure_cb(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   struct raop_session *rs;
 
   rs = (struct raop_session *)arg;
 
+  http_request_free(req);
+
   raop_session_failure(rs);
+
+  return 0;
 }
 
 
 /* Metadata handling */
-static void
-raop_cb_metadata(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_metadata(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto error;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for metadata/artwork/progress: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for metadata/artwork/progress: %d %s\n", code, reason);
 
       goto error;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto error;
+
+  http_request_free(req);
 
   /* No status_cb call, user doesn't want/need to know about the status
    * of metadata requests unless they cause the session to fail.
    */
 
-  if (!rs->reqs_in_flight)
-    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
-
-  return;
+  return 0;
 
  error:
+  http_request_free(req);
   raop_session_failure(rs);
+
+  return 0;
 }
 
 static int
-raop_metadata_send_progress(struct raop_session *rs, struct evbuffer *evbuf, struct raop_metadata *rmd, uint64_t offset, uint32_t delay)
+raop_metadata_send_progress(struct raop_session *rs, struct raop_metadata *rmd, uint64_t offset, uint32_t delay)
 {
+  struct evbuffer *evbuf;
   uint32_t display;
   int ret;
 
@@ -1994,14 +1951,24 @@ raop_metadata_send_progress(struct raop_session *rs, struct evbuffer *evbuf, str
 
   display = RAOP_RTPTIME(rmd->start - delay);
 
+  evbuf = evbuffer_new();
+  if (!evbuf)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not allocate temp evbuffer for metadata processing\n");
+
+      return -1;
+    }
+
   ret = evbuffer_add_printf(evbuf, "progress: %u/%u/%u\r\n", display, RAOP_RTPTIME(rmd->start + offset), RAOP_RTPTIME(rmd->end));
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not build progress string for sending\n");
 
+      evbuffer_free(evbuf);
       return -1;
     }
 
+  /* evbuf owned by raop_send_req_set_parameter() */
   ret = raop_send_req_set_parameter(rs, evbuf, "text/parameters", NULL, raop_cb_metadata);
   if (ret < 0)
     DPRINTF(E_LOG, L_RAOP, "Could not send SET_PARAMETER request for metadata\n");
@@ -2010,8 +1977,9 @@ raop_metadata_send_progress(struct raop_session *rs, struct evbuffer *evbuf, str
 }
 
 static int
-raop_metadata_send_artwork(struct raop_session *rs, struct evbuffer *evbuf, struct raop_metadata *rmd, char *rtptime)
+raop_metadata_send_artwork(struct raop_session *rs, struct raop_metadata *rmd, char *rtptime)
 {
+  struct evbuffer *evbuf;
   char *ctype;
   int ret;
 
@@ -2031,14 +1999,24 @@ raop_metadata_send_artwork(struct raop_session *rs, struct evbuffer *evbuf, stru
 	return -1;
     }
 
+  evbuf = evbuffer_new();
+  if (!evbuf)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not allocate temp evbuffer for metadata processing\n");
+
+      return -1;
+    }
+
   ret = evbuffer_add(evbuf, EVBUFFER_DATA(rmd->artwork), EVBUFFER_LENGTH(rmd->artwork));
   if (ret != 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not copy artwork for sending\n");
 
+      evbuffer_free(evbuf);
       return -1;
     }
 
+  /* evbuf owned by raop_send_req_set_parameter() */
   ret = raop_send_req_set_parameter(rs, evbuf, ctype, rtptime, raop_cb_metadata);
   if (ret < 0)
     DPRINTF(E_LOG, L_RAOP, "Could not send SET_PARAMETER request for metadata\n");
@@ -2047,29 +2025,8 @@ raop_metadata_send_artwork(struct raop_session *rs, struct evbuffer *evbuf, stru
 }
 
 static int
-raop_metadata_send_metadata(struct raop_session *rs, struct evbuffer *evbuf, struct raop_metadata *rmd, char *rtptime)
+raop_metadata_send_metadata(struct raop_session *rs, struct raop_metadata *rmd, char *rtptime)
 {
-  int ret;
-
-  ret = evbuffer_add(evbuf, EVBUFFER_DATA(rmd->metadata), EVBUFFER_LENGTH(rmd->metadata));
-  if (ret != 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not copy metadata for sending\n");
-
-      return -1;
-    }
-
-  ret = raop_send_req_set_parameter(rs, evbuf, "application/x-dmap-tagged", rtptime, raop_cb_metadata);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_RAOP, "Could not send SET_PARAMETER request for metadata\n");
-
-  return ret;
-}
-
-static int
-raop_metadata_send_internal(struct raop_session *rs, struct raop_metadata *rmd, uint64_t offset, uint32_t delay)
-{
-  char rtptime[32];
   struct evbuffer *evbuf;
   int ret;
 
@@ -2081,50 +2038,66 @@ raop_metadata_send_internal(struct raop_session *rs, struct raop_metadata *rmd, 
       return -1;
     }
 
+  ret = evbuffer_add(evbuf, EVBUFFER_DATA(rmd->metadata), EVBUFFER_LENGTH(rmd->metadata));
+  if (ret != 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not copy metadata for sending\n");
+
+      evbuffer_free(evbuf);
+      return -1;
+    }
+
+  /* evbuf owned by raop_send_req_set_parameter() */
+  ret = raop_send_req_set_parameter(rs, evbuf, "application/x-dmap-tagged", rtptime, raop_cb_metadata);
+  if (ret < 0)
+    DPRINTF(E_LOG, L_RAOP, "Could not send SET_PARAMETER request for metadata\n");
+
+  return ret;
+}
+
+static int
+raop_metadata_send_internal(struct raop_session *rs, struct raop_metadata *rmd, uint64_t offset, uint32_t delay)
+{
+  char rtptime[32];
+  int ret;
+
   ret = snprintf(rtptime, sizeof(rtptime), "rtptime=%u", RAOP_RTPTIME(rmd->start));
   if ((ret < 0) || (ret >= sizeof(rtptime)))
     {
       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer while sending metadata\n");
 
-      ret = -1;
-      goto out;
+      return -1;
     }
 
-  ret = raop_metadata_send_metadata(rs, evbuf, rmd, rtptime);
+  ret = raop_metadata_send_metadata(rs, rmd, rtptime);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not send metadata to %s\n", rs->devname);
 
-      ret = -1;
-      goto out;
+      return -1;
     }
 
   if (!rmd->artwork)
     goto skip_artwork;
 
-  ret = raop_metadata_send_artwork(rs, evbuf, rmd, rtptime);
+  ret = raop_metadata_send_artwork(rs, rmd, rtptime);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not send artwork to %s\n", rs->devname);
 
-      ret = -1;
-      goto out;
+      return -1;
     }
 
  skip_artwork:
-  ret = raop_metadata_send_progress(rs, evbuf, rmd, offset, delay);
+  ret = raop_metadata_send_progress(rs, rmd, offset, delay);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not send progress to %s\n", rs->devname);
 
-      ret = -1;
-      goto out;
+      return -1;
     }
 
- out:
-  evbuffer_free(evbuf);
-
-  return ret;
+  return 0;
 }
 
 static void
@@ -2222,7 +2195,7 @@ raop_volume_convert(int volume)
 }
 
 static int
-raop_set_volume_internal(struct raop_session *rs, int volume, evrtsp_req_cb cb)
+raop_set_volume_internal(struct raop_session *rs, int volume, http_cb cb)
 {
   struct evbuffer *evbuf;
   float raop_volume;
@@ -2248,52 +2221,53 @@ raop_set_volume_internal(struct raop_session *rs, int volume, evrtsp_req_cb cb)
       return -1;
     }
 
+  /* evbuf owned by raop_send_req_set_parameter() */
   ret = raop_send_req_set_parameter(rs, evbuf, "text/parameters", NULL, cb);
   if (ret < 0)
     DPRINTF(E_LOG, L_RAOP, "Could not send SET_PARAMETER request for volume\n");
 
-  evbuffer_free(evbuf);
-
   return ret;
 }
 
-static void
-raop_cb_set_volume(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_set_volume(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   raop_status_cb status_cb;
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto error;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for stream volume: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for stream volume: %d %s\n", code, reason);
 
       goto error;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto error;
+
+  http_request_free(req);
 
   /* Let our user know */
   status_cb = rs->status_cb;
   rs->status_cb = NULL;
   status_cb(rs->dev, rs, rs->state);
 
-  if (!rs->reqs_in_flight)
-    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
-
-  return;
+  return 0;
 
  error:
+  http_request_free(req);
   raop_session_failure(rs);
+
+  return 0;
 }
 
 /* Volume in [0 - 100] */
@@ -2318,30 +2292,32 @@ raop_set_volume_one(struct raop_session *rs, int volume, raop_status_cb cb)
   return 1;
 }
 
-static void
-raop_cb_flush(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_flush(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   raop_status_cb status_cb;
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto error;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "FLUSH request failed: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "FLUSH request failed: %d %s\n", code, reason);
 
       goto error;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto error;
+
+  http_request_free(req);
 
   rs->state = RAOP_CONNECTED;
 
@@ -2350,19 +2326,26 @@ raop_cb_flush(struct evrtsp_request *req, void *arg)
   rs->status_cb = NULL;
   status_cb(rs->dev, rs, rs->state);
 
-  if (!rs->reqs_in_flight)
-    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
-
-  return;
+  return 0;
 
  error:
+  http_request_free(req);
   raop_session_failure(rs);
+
+  return 0;
 }
 
 static void
-raop_flush_timer_cb(int fd, short what, void *arg)
+raop_flush_timer_cb(void *arg)
 {
   struct raop_session *rs;
+
+  if (!flush_timer_src)
+    return;
+
+  dispatch_source_cancel(flush_timer_src);
+  dispatch_release(flush_timer_src);
+  flush_timer_src = NULL;
 
   DPRINTF(E_DBG, L_RAOP, "Flush timer expired; tearing down RAOP sessions\n");
 
@@ -2378,7 +2361,6 @@ raop_flush_timer_cb(int fd, short what, void *arg)
 int
 raop_flush(raop_status_cb cb, uint64_t rtptime)
 {
-  struct timeval tv;
   struct raop_session *rs;
   int pending;
   int ret;
@@ -2403,20 +2385,49 @@ raop_flush(raop_status_cb cb, uint64_t rtptime)
 
   if (pending > 0)
     {
-      evtimer_set(&flush_timer, raop_flush_timer_cb, NULL);
-      event_base_set(evbase_player, &flush_timer);
-      evutil_timerclear(&tv);
-      tv.tv_sec = 10;
-      evtimer_add(&flush_timer, &tv);
+      if (!flush_timer_src)
+	{
+	  flush_timer_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, player_sq);
+	  if (!flush_timer_src)
+	    {
+	      DPRINTF(E_LOG, L_RAOP, "Could not create flush timer dispatch source\n");
+
+	      return pending;
+	    }
+
+	  dispatch_source_set_event_handler_f(flush_timer_src, raop_flush_timer_cb);
+	}
+      else
+	dispatch_suspend(flush_timer_src);
+
+      dispatch_source_set_timer(flush_timer_src,
+				dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+				DISPATCH_TIME_FOREVER /* one-shot */, 0);
+
+      dispatch_resume(flush_timer_src);
     }
 
   return pending;
 }
 
 
+/* Generic service cancel handler */
+static void
+raop_v2_svc_cancel_cb(void *arg)
+{
+  struct raop_service *svc;
+
+  svc = (struct raop_service *)arg;
+
+  close(svc->fd);
+  svc->fd = -1;
+  svc->port = 0;
+}
+
+
 /* AirTunes v2 time synchronization */
 static void
-raop_v2_timing_cb(int fd, short what, void *arg)
+raop_v2_timing_cb(void *arg)
 {
   char address[INET6_ADDRSTRLEN];
   union sockaddr_all sa;
@@ -2431,12 +2442,20 @@ raop_v2_timing_cb(int fd, short what, void *arg)
 
   svc = (struct raop_service *)arg;
 
+  if (dispatch_source_get_data(svc->source) == 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Timing service socket error\n");
+
+      dispatch_source_cancel(svc->source);
+      return;
+    }
+
   ret = raop_v2_timing_get_clock_ntp(&recv_stamp);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Couldn't get receive timestamp\n");
 
-      goto readd;
+      return;
     }
 
   len = sizeof(sa.ss);
@@ -2445,21 +2464,21 @@ raop_v2_timing_cb(int fd, short what, void *arg)
     {
       DPRINTF(E_LOG, L_RAOP, "Error reading timing request: %s\n", strerror(errno));
 
-      goto readd;
+      return;
     }
 
   if (ret != 32)
     {
       DPRINTF(E_DBG, L_RAOP, "Got timing request with size %d\n", ret);
 
-      goto readd;
+      return;
     }
 
   switch (sa.ss.ss_family)
     {
       case AF_INET:
 	if (svc != &timing_4svc)
-	  goto readd;
+	  return;
 
 	for (rs = sessions; rs; rs = rs->next)
 	  {
@@ -2475,7 +2494,7 @@ raop_v2_timing_cb(int fd, short what, void *arg)
 
       case AF_INET6:
 	if (svc != &timing_6svc)
-	  goto readd;
+	  return;
 
 	for (rs = sessions; rs; rs = rs->next)
 	  {
@@ -2491,7 +2510,7 @@ raop_v2_timing_cb(int fd, short what, void *arg)
 
       default:
 	DPRINTF(E_LOG, L_RAOP, "Time sync: Unknown address family %d\n", sa.ss.ss_family);
-	goto readd;
+	return;
     }
 
   if (!rs)
@@ -2501,14 +2520,14 @@ raop_v2_timing_cb(int fd, short what, void *arg)
       else
 	DPRINTF(E_LOG, L_RAOP, "Time sync request from %s; not a RAOP client\n", address);
 
-      goto readd;
+      return;
     }
 
   if ((req[0] != 0x80) || (req[1] != 0xd2))
     {
       DPRINTF(E_LOG, L_RAOP, "Packet header doesn't match timing request\n");
 
-      goto readd;
+      return;
     }
 
   memset(res, 0, sizeof(res));
@@ -2549,20 +2568,7 @@ raop_v2_timing_cb(int fd, short what, void *arg)
 
   ret = sendto(svc->fd, res, sizeof(res), 0, &sa.sa, len);
   if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not send timing reply: %s\n", strerror(errno));
-
-      goto readd;
-    }
-
- readd:
-  ret = event_add(&svc->ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't re-add event for timing requests\n");
-
-      return;
-    }
+    DPRINTF(E_LOG, L_RAOP, "Could not send timing reply: %s\n", strerror(errno));
 }
 
 static int
@@ -2645,15 +2651,19 @@ raop_v2_timing_start_one(struct raop_service *svc, int family)
 	break;
     }
 
-  event_set(&svc->ev, svc->fd, EV_READ, raop_v2_timing_cb, svc);
-  event_base_set(evbase_player, &svc->ev);
-  ret = event_add(&svc->ev, NULL);
-  if (ret < 0)
+  svc->source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, svc->fd, 0, player_sq);
+  if (!svc->source)
     {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't add event for timing requests\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not create dispatch source for timing requests\n");
 
       goto out_fail;
     }
+
+  dispatch_set_context(svc->source, svc);
+  dispatch_source_set_cancel_handler_f(svc->source, raop_v2_svc_cancel_cb);
+  dispatch_source_set_event_handler_f(svc->source, raop_v2_timing_cb);
+
+  dispatch_resume(svc->source);
 
   return 0;
 
@@ -2668,21 +2678,19 @@ raop_v2_timing_start_one(struct raop_service *svc, int family)
 static void
 raop_v2_timing_stop(void)
 {
-  if (event_initialized(&timing_4svc.ev))
-    event_del(&timing_4svc.ev);
+  if (timing_4svc.source)
+    {
+      dispatch_source_cancel(timing_4svc.source);
+      dispatch_release(timing_4svc.source);
+      timing_4svc.source = NULL;
+    }
 
-  if (event_initialized(&timing_6svc.ev))
-    event_del(&timing_6svc.ev);
-
-  close(timing_4svc.fd);
-
-  timing_4svc.fd = -1;
-  timing_4svc.port = 0;
-
-  close(timing_6svc.fd);
-
-  timing_6svc.fd = -1;
-  timing_6svc.port = 0;
+  if (timing_6svc.source)
+    {
+      dispatch_source_cancel(timing_6svc.source);
+      dispatch_release(timing_6svc.source);
+      timing_6svc.source = NULL;
+    }
 }
 
 static int
@@ -2791,7 +2799,7 @@ static void
 raop_v2_resend_range(struct raop_session *rs, uint16_t seqnum, uint16_t len);
 
 static void
-raop_v2_control_cb(int fd, short what, void *arg)
+raop_v2_control_cb(void *arg)
 {
   char address[INET6_ADDRSTRLEN];
   union sockaddr_all sa;
@@ -2805,27 +2813,35 @@ raop_v2_control_cb(int fd, short what, void *arg)
 
   svc = (struct raop_service *)arg;
 
+  if (dispatch_source_get_data(svc->source) == 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Control service socket error\n");
+
+      dispatch_source_cancel(svc->source);
+      return;
+    }
+
   len = sizeof(sa.ss);
   ret = recvfrom(svc->fd, req, sizeof(req), 0, &sa.sa, (socklen_t *)&len);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Error reading control request: %s\n", strerror(errno));
 
-      goto readd;
+      return;
     }
 
   if (ret != 8)
     {
       DPRINTF(E_DBG, L_RAOP, "Got control request with size %d\n", ret);
 
-      goto readd;
+      return;
     }
 
   switch (sa.ss.ss_family)
     {
       case AF_INET:
 	if (svc != &control_4svc)
-	  goto readd;
+	  return;
 
 	for (rs = sessions; rs; rs = rs->next)
 	  {
@@ -2841,7 +2857,7 @@ raop_v2_control_cb(int fd, short what, void *arg)
 
       case AF_INET6:
 	if (svc != &control_6svc)
-	  goto readd;
+	  return;
 
 	for (rs = sessions; rs; rs = rs->next)
 	  {
@@ -2857,7 +2873,7 @@ raop_v2_control_cb(int fd, short what, void *arg)
 
       default:
 	DPRINTF(E_LOG, L_RAOP, "Control svc: Unknown address family %d\n", sa.ss.ss_family);
-	goto readd;
+	return;
     }
 
   if (!rs)
@@ -2867,14 +2883,14 @@ raop_v2_control_cb(int fd, short what, void *arg)
       else
 	DPRINTF(E_LOG, L_RAOP, "Control request from %s; not a RAOP client\n", address);
 
-      goto readd;
+      return;
     }
 
   if ((req[0] != 0x80) || (req[1] != 0xd5))
     {
       DPRINTF(E_LOG, L_RAOP, "Packet header doesn't match retransmit request\n");
 
-      goto readd;
+      return;
     }
 
   memcpy(&seq_start, req + 4, 2);
@@ -2886,15 +2902,6 @@ raop_v2_control_cb(int fd, short what, void *arg)
   DPRINTF(E_DBG, L_RAOP, "Got retransmit request, seq_start %u len %u\n", seq_start, seq_len);
 
   raop_v2_resend_range(rs, seq_start, seq_len);
-
- readd:
-  ret = event_add(&svc->ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't re-add event for control requests\n");
-
-      return;
-    }
 }
 
 static int
@@ -2977,15 +2984,19 @@ raop_v2_control_start_one(struct raop_service *svc, int family)
 	break;
     }
 
-  event_set(&svc->ev, svc->fd, EV_READ, raop_v2_control_cb, svc);
-  event_base_set(evbase_player, &svc->ev);
-  ret = event_add(&svc->ev, NULL);
-  if (ret < 0)
+  svc->source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, svc->fd, 0, player_sq);
+  if (!svc->source)
     {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't add event for control requests\n");
+      DPRINTF(E_LOG, L_RAOP, "Could not create dispatch source for control requests\n");
 
       goto out_fail;
     }
+
+  dispatch_set_context(svc->source, svc);
+  dispatch_source_set_cancel_handler_f(svc->source, raop_v2_svc_cancel_cb);
+  dispatch_source_set_event_handler_f(svc->source, raop_v2_control_cb);
+
+  dispatch_resume(svc->source);
 
   return 0;
 
@@ -3000,21 +3011,19 @@ raop_v2_control_start_one(struct raop_service *svc, int family)
 static void
 raop_v2_control_stop(void)
 {
-  if (event_initialized(&control_4svc.ev))
-    event_del(&control_4svc.ev);
+  if (control_4svc.source)
+    {
+      dispatch_source_cancel(control_4svc.source);
+      dispatch_release(control_4svc.source);
+      control_4svc.source = NULL;
+    }
 
-  if (event_initialized(&control_6svc.ev))
-    event_del(&control_6svc.ev);
-
-  close(control_4svc.fd);
-
-  control_4svc.fd = -1;
-  control_4svc.port = 0;
-
-  close(control_6svc.fd);
-
-  control_6svc.fd = -1;
-  control_6svc.port = 0;
+  if (control_6svc.source)
+    {
+      dispatch_source_cancel(control_6svc.source);
+      dispatch_release(control_6svc.source);
+      control_6svc.source = NULL;
+    }
 }
 
 static int
@@ -3359,28 +3368,28 @@ raop_startup_cancel(struct raop_session *rs)
     raop_session_failure(rs);
 }
 
-static void
-raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_startup_volume(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   raop_status_cb status_cb;
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", code, reason);
 
       goto cleanup;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto cleanup;
 
@@ -3394,72 +3403,81 @@ raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
       goto cleanup;
     }
 
+  http_request_free(req);
+
   /* Session startup and setup is done, tell our user */
   status_cb = rs->status_cb;
   rs->status_cb = NULL;
 
   status_cb(rs->dev, rs, rs->state);
 
-  if (!rs->reqs_in_flight)
-    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
-
-  return;
+  return 0;
 
  cleanup:
+  http_request_free(req);
   raop_startup_cancel(rs);
+
+  return 0;
 }
 
-static void
-raop_cb_startup_record(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_startup_record(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   struct raop_session *rs;
   const char *param;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "RECORD request failed in session startup: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "RECORD request failed in session startup: %d %s\n", code, reason);
 
       goto cleanup;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto cleanup;
 
   /* Audio latency */
-  param = evrtsp_find_header(req->input_headers, "Audio-Latency");
+  param = http_response_get_header(r, "Audio-Latency");
   if (!param)
     DPRINTF(E_INFO, L_RAOP, "RECORD reply from %s did not have an Audio-Latency header\n", rs->devname);
   else
     DPRINTF(E_DBG, L_RAOP, "RAOP audio latency is %s\n", param);
+
+  http_request_free(req);
 
   rs->state = RAOP_RECORD;
 
   /* Set initial volume */
   raop_set_volume_internal(rs, rs->volume, raop_cb_startup_volume);
 
-  return;
+  return 0;
 
  cleanup:
+  http_request_free(req);
   raop_startup_cancel(rs);
+
+  return 0;
 }
 
-static void
-raop_cb_startup_setup(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_startup_setup(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   struct raop_session *rs;
   const char *param;
+  const char *reason;
   char *transport;
   char *token;
   char *ptr;
+  int code;
   int tmp;
   int ret;
 
@@ -3467,22 +3485,20 @@ raop_cb_startup_setup(struct evrtsp_request *req, void *arg)
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "SETUP request failed in session startup: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "SETUP request failed in session startup: %d %s\n", code, reason);
 
       goto cleanup;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto cleanup;
 
   /* Server-side session ID */
-  param = evrtsp_find_header(req->input_headers, "Session");
+  param = http_response_get_header(r, "Session");
   if (!param)
     {
       DPRINTF(E_LOG, L_RAOP, "Missing Session header in SETUP reply\n");
@@ -3493,7 +3509,7 @@ raop_cb_startup_setup(struct evrtsp_request *req, void *arg)
   rs->session = strdup(param);
 
   /* Check transport and get remote streaming port */
-  param = evrtsp_find_header(req->input_headers, "Transport");
+  param = http_response_get_header(r, "Transport");
   if (!param)
     {
       DPRINTF(E_LOG, L_RAOP, "Missing Transport header in SETUP reply\n");
@@ -3596,33 +3612,38 @@ raop_cb_startup_setup(struct evrtsp_request *req, void *arg)
   if (ret < 0)
     goto cleanup;
 
-  return;
+  http_request_free(req);
+
+  return 0;
 
  cleanup:
+  http_request_free(req);
   raop_startup_cancel(rs);
+
+  return 0;
 }
 
-static void
-raop_cb_startup_announce(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_startup_announce(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "ANNOUNCE request failed in session startup: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "ANNOUNCE request failed in session startup: %d %s\n", code, reason);
 
       goto cleanup;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto cleanup;
 
@@ -3633,37 +3654,42 @@ raop_cb_startup_announce(struct evrtsp_request *req, void *arg)
   if (ret < 0)
     goto cleanup;
 
-  return;
+  http_request_free(req);
+
+  return 0;
 
  cleanup:
+  http_request_free(req);
   raop_startup_cancel(rs);
+
+  return 0;
 }
 
-static void
-raop_cb_startup_options(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_startup_options(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto cleanup;
-
-  if ((req->response_code != RTSP_OK) && (req->response_code != RTSP_UNAUTHORIZED))
+  code = http_response_get_status(r, &reason);
+  if ((code != HTTP_OK) && (code != HTTP_UNAUTHORIZED))
     {
-      DPRINTF(E_LOG, L_RAOP, "OPTIONS request failed in session startup: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "OPTIONS request failed in session startup: %d %s\n", code, reason);
 
       goto cleanup;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto cleanup;
 
-  if (req->response_code == RTSP_UNAUTHORIZED)
+  if (code == HTTP_UNAUTHORIZED)
     {
       if (rs->req_has_auth)
 	{
@@ -3673,7 +3699,7 @@ raop_cb_startup_options(struct evrtsp_request *req, void *arg)
 	  goto cleanup;
 	}
 
-      ret = raop_parse_auth(rs, req);
+      ret = raop_parse_auth(rs, r);
       if (ret < 0)
 	goto cleanup;
 
@@ -3685,7 +3711,9 @@ raop_cb_startup_options(struct evrtsp_request *req, void *arg)
 	  goto cleanup;
 	}
 
-      return;
+      http_request_free(req);
+
+      return 0;
     }
 
   rs->state = RAOP_OPTIONS;
@@ -3695,37 +3723,44 @@ raop_cb_startup_options(struct evrtsp_request *req, void *arg)
   if (ret < 0)
     goto cleanup;
 
-  return;
+  http_request_free(req);
+
+  return 0;
 
  cleanup:
+  http_request_free(req);
   raop_startup_cancel(rs);
+
+  return 0;
 }
 
 
-static void
-raop_cb_shutdown_teardown(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_shutdown_teardown(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   raop_status_cb status_cb;
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto error;
-
-  if (req->response_code != RTSP_OK)
+  code = http_response_get_status(r, &reason);
+  if (code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_RAOP, "TEARDOWN request failed in session shutdown: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "TEARDOWN request failed in session shutdown: %d %s\n", code, reason);
 
       goto error;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto error;
+
+  http_request_free(req);
 
   rs->state = RAOP_STOPPED;
 
@@ -3737,38 +3772,41 @@ raop_cb_shutdown_teardown(struct evrtsp_request *req, void *arg)
 
   raop_session_cleanup(rs);
 
-  return;
+  return 0;
 
  error:
+  http_request_free(req);
   raop_session_failure(rs);
+
+  return 0;
 }
 
-static void
-raop_cb_probe_options(struct evrtsp_request *req, void *arg)
+static int
+raop_cb_probe_options(struct http_connection *c, struct http_request *req, struct http_response *r, void *arg)
 {
   raop_status_cb status_cb;
   struct raop_session *rs;
+  const char *reason;
+  int code;
   int ret;
 
   rs = (struct raop_session *)arg;
 
   rs->reqs_in_flight--;
 
-  if (!req)
-    goto cleanup;
-
-  if ((req->response_code != RTSP_OK) && (req->response_code != RTSP_UNAUTHORIZED))
+  code = http_response_get_status(r, &reason);
+  if ((code != HTTP_OK) && (code != HTTP_UNAUTHORIZED))
     {
-      DPRINTF(E_LOG, L_RAOP, "OPTIONS request failed in device probe: %d %s\n", req->response_code, req->response_code_line);
+      DPRINTF(E_LOG, L_RAOP, "OPTIONS request failed in device probe: %d %s\n", code, reason);
 
       goto cleanup;
     }
 
-  ret = raop_check_cseq(rs, req);
+  ret = raop_check_cseq(rs, req, r);
   if (ret < 0)
     goto cleanup;
 
-  if (req->response_code == RTSP_UNAUTHORIZED)
+  if (code == HTTP_UNAUTHORIZED)
     {
       if (rs->req_has_auth)
 	{
@@ -3778,7 +3816,7 @@ raop_cb_probe_options(struct evrtsp_request *req, void *arg)
 	  goto cleanup;
 	}
 
-      ret = raop_parse_auth(rs, req);
+      ret = raop_parse_auth(rs, r);
       if (ret < 0)
 	goto cleanup;
 
@@ -3790,8 +3828,12 @@ raop_cb_probe_options(struct evrtsp_request *req, void *arg)
 	  goto cleanup;
 	}
 
-      return;
+      http_request_free(req);
+
+      return 0;
     }
+
+  http_request_free(req);
 
   rs->state = RAOP_OPTIONS;
 
@@ -3804,10 +3846,13 @@ raop_cb_probe_options(struct evrtsp_request *req, void *arg)
   /* We're not going further with this session */
   raop_session_cleanup(rs);
 
-  return;
+  return 0;
 
  cleanup:
+  http_request_free(req);
   raop_session_failure(rs);
+
+  return 0;
 }
 
 
@@ -3911,8 +3956,12 @@ raop_playback_start(uint64_t next_pkt, struct timespec *ts)
 {
   struct raop_session *rs;
 
-  if (event_initialized(&flush_timer))
-    event_del(&flush_timer);
+  if (flush_timer_src)
+    {
+      dispatch_source_cancel(flush_timer_src);
+      dispatch_release(flush_timer_src);
+      flush_timer_src = NULL;
+    }
 
   sync_counter = 0;
 
@@ -3958,17 +4007,22 @@ raop_init(int *v6enabled)
 
   timing_4svc.fd = -1;
   timing_4svc.port = 0;
+  timing_4svc.source = NULL;
 
   timing_6svc.fd = -1;
   timing_6svc.port = 0;
+  timing_6svc.source = NULL;
 
   control_4svc.fd = -1;
   control_4svc.port = 0;
+  control_4svc.source = NULL;
 
   control_6svc.fd = -1;
   control_6svc.port = 0;
+  control_6svc.source = NULL;
 
   sessions = NULL;
+  flush_timer_src = NULL;
 
   pktbuf_size = 0;
   pktbuf_head = NULL;
@@ -4070,14 +4124,8 @@ raop_init(int *v6enabled)
 void
 raop_deinit(void)
 {
-  struct raop_session *rs;
-
-  for (rs = sessions; sessions; rs = sessions)
-    {
-      sessions = rs->next;
-
-      raop_session_free(rs);
-    }
+  if (sessions)
+    DPRINTF(E_LOG, L_RAOP, "WARNING: remaining active sessions at shutdown\n");
 
   raop_v2_timing_stop();
   raop_v2_control_stop();
