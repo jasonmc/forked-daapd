@@ -38,11 +38,7 @@
 # include <sys/event.h>
 #endif
 
-#if defined(HAVE_SYS_EVENTFD_H) && defined(HAVE_EVENTFD)
-# define USE_EVENTFD
-# include <sys/eventfd.h>
-#endif
-
+#include <dispatch/dispatch.h>
 #include <event.h>
 
 #include <gcrypt.h>
@@ -78,12 +74,6 @@ struct volume_param {
 struct player_command;
 typedef int (*cmd_func)(struct player_command *cmd);
 
-struct spk_enum
-{
-  spk_enum_cb cb;
-  void *arg;
-};
-
 struct player_command
 {
   pthread_mutex_t lck;
@@ -92,13 +82,9 @@ struct player_command
   cmd_func func;
   cmd_func func_bh;
 
-  int nonblock;
-
   union {
     struct volume_param vol_param;
     void *noarg;
-    struct spk_enum *spk_enum;
-    struct raop_device *rd;
     struct player_status *status;
     struct player_source *ps;
     player_status_handler status_handler;
@@ -143,18 +129,9 @@ static const char *raop_devtype[] =
   };
 
 
-struct event_base *evbase_player;
-
-#ifdef USE_EVENTFD
-static int exit_efd;
-#else
-static int exit_pipe[2];
-#endif
-static int cmd_pipe[2];
-static int player_exit;
-static struct event exitev;
-static struct event cmdev;
-static pthread_t tid_player;
+/* Exported to raop.c */
+dispatch_queue_t player_sq;
+dispatch_group_t player_grp;
 
 /* Player status */
 static enum play_status player_state;
@@ -166,7 +143,7 @@ static player_status_handler update_handler;
 
 /* Playback timer */
 static int pb_timer_fd;
-static struct event pb_timer_ev;
+static dispatch_source_t pb_timer_src;
 #if defined(__linux__)
 static struct timespec pb_timer_last;
 #endif
@@ -193,7 +170,9 @@ static int laudio_relvol;
 static int raop_sessions;
 
 /* Commands */
+static int cmd_pipe[2];
 static struct player_command *cur_cmd;
+static dispatch_source_t cmd_src;
 
 /* Last commanded volume */
 static int master_volume;
@@ -220,7 +199,7 @@ command_async_end(struct player_command *cmd)
   pthread_mutex_unlock(&cmd->lck);
 
   /* Process commands again */
-  event_add(&cmdev, NULL);
+  dispatch_resume(cmd_src);
 }
 
 static void
@@ -561,7 +540,7 @@ metadata_send(struct player_source *ps, int startup)
 
 
 /* Audio sources */
-/* Thread: httpd (DACP) */
+/* Queue: HTTP read queue (DACP) */
 static struct player_source *
 player_queue_make(struct query_params *qp, const char *sort)
 {
@@ -585,6 +564,7 @@ player_queue_make(struct query_params *qp, const char *sort)
 	qp->sort = S_ARTIST;
     }
 
+  /* Database handle provided by DACP */
   ret = db_query_start(qp);
   if (ret < 0)
     {
@@ -655,7 +635,7 @@ player_queue_make(struct query_params *qp, const char *sort)
   return q_head;
 }
 
-/* Thread: httpd (DACP) */
+/* Queue: HTTP read queue (DACP) */
 struct player_source *
 player_queue_make_daap(const char *query, const char *sort)
 {
@@ -832,13 +812,25 @@ static int
 source_open(struct player_source *ps, int no_md)
 {
   struct media_file_info *mfi;
+  int ret;
 
   ps->stream_start = 0;
   ps->output_start = 0;
   ps->end = 0;
   ps->play_next = NULL;
 
+  ret = db_pool_get();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not acquire database connection; cannot get file info\n");
+
+      return -1;
+    }
+
   mfi = db_file_fetch_byid(ps->id);
+
+  db_pool_release();
+
   if (!mfi)
     {
       DPRINTF(E_LOG, L_PLAYER, "Couldn't fetch file id %d\n", ps->id);
@@ -1258,16 +1250,27 @@ playback_write(void)
     raop_v2_write(rawbuf, last_rtptime);
 }
 
-#if defined(__linux__)
+/* Queue: player_sq */
 static void
-player_playback_cb(int fd, short what, void *arg)
+player_playback_cancel_cb(void *arg)
+{
+  close(pb_timer_fd);
+  pb_timer_fd = -1;
+
+  dispatch_group_leave(player_grp);
+}
+
+#if defined(__linux__)
+/* Queue: player_sq */
+static void
+player_playback_cb(void *arg)
 {
   struct itimerspec next;
   uint64_t ticks;
   int ret;
 
   /* Acknowledge timer */
-  read(fd, &ticks, sizeof(ticks));
+  read(pb_timer_fd, &ticks, sizeof(ticks));
 
   playback_write();
 
@@ -1295,22 +1298,14 @@ player_playback_cb(int fd, short what, void *arg)
       playback_abort();
       return;
     }
-
-  ret = event_add(&pb_timer_ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not re-add playback timer event\n");
-
-      playback_abort();
-      return;
-    }
 }
 #endif /* __linux__ */
 
 
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+/* Queue: player_sq */
 static void
-player_playback_cb(int fd, short what, void *arg)
+player_playback_cb(void *arg)
 {
   struct timespec ts;
   struct kevent kev;
@@ -1329,15 +1324,6 @@ player_playback_cb(int fd, short what, void *arg)
       /* Make sure playback is still running */
       if (player_state == PLAY_STOPPED)
 	return;
-    }
-
-  ret = event_add(&pb_timer_ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not re-add playback timer event\n");
-
-      playback_abort();
-      return;
     }
 }
 #endif /* __FreeBSD__ || __FreeBSD_kernel__ */
@@ -1384,9 +1370,17 @@ device_remove(struct raop_device *dev)
     speaker_deselect_raop(dev);
 
   /* Save device volume */
-  ret = db_speaker_save(dev->id, 0, dev->volume);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_PLAYER, "Could not save state for speaker %s\n", dev->name);
+  ret = db_pool_get();
+  if (ret == 0)
+    {
+      ret = db_speaker_save(dev->id, 0, dev->volume);
+      if (ret < 0)
+	DPRINTF(E_LOG, L_PLAYER, "Could not save state for speaker %s\n", dev->name);
+
+      db_pool_release();
+    }
+  else
+    DPRINTF(E_LOG, L_PLAYER, "Could not acquire database connection; cannot save speaker state\n");
 
   if (!prev)
     dev_list = dev->next;
@@ -1410,15 +1404,16 @@ device_check(struct raop_device *dev)
   return (rd) ? 0 : -1;
 }
 
-static int
-device_add(struct player_command *cmd)
+/* Queue: player_sq */
+static void
+device_add(void *arg)
 {
   struct raop_device *dev;
   struct raop_device *rd;
   int selected;
   int ret;
 
-  dev = cmd->arg.rd;
+  dev = (struct raop_device *)arg;
 
   for (rd = dev_list; rd; rd = rd->next)
     {
@@ -1431,15 +1426,24 @@ device_add(struct player_command *cmd)
     {
       rd = dev;
 
-      ret = db_speaker_get(rd->id, &selected, &rd->volume);
-      if (ret < 0)
+      /* Get a database connection */
+      ret = db_pool_get();
+      if (ret == 0)
 	{
-	  selected = 0;
-	  rd->volume = (master_volume >= 0) ? master_volume : 75;
-	}
+	  ret = db_speaker_get(rd->id, &selected, &rd->volume);
+	  if (ret < 0)
+	    {
+	      selected = 0;
+	      rd->volume = (master_volume >= 0) ? master_volume : 75;
+	    }
 
-      if (dev_autoselect && selected)
-	speaker_select_raop(rd);
+	  if (dev_autoselect && selected)
+	    speaker_select_raop(rd);
+
+	  db_pool_release();
+	}
+      else
+	rd->volume = (master_volume >= 0) ? master_volume : 75;
 
       rd->next = dev_list;
       dev_list = rd;
@@ -1484,17 +1488,16 @@ device_add(struct player_command *cmd)
 
       device_free(dev);
     }
-
-  return 0;
 }
 
-static int
-device_remove_family(struct player_command *cmd)
+/* Queue: player_sq */
+static void
+device_remove_family(void *arg)
 {
   struct raop_device *dev;
   struct raop_device *rd;
 
-  dev = cmd->arg.rd;
+  dev = (struct raop_device *)arg;
 
   for (rd = dev_list; rd; rd = rd->next)
     {
@@ -1507,7 +1510,7 @@ device_remove_family(struct player_command *cmd)
       DPRINTF(E_WARN, L_PLAYER, "AirTunes device %s stopped advertising, but not in our list\n", dev->name);
 
       device_free(dev);
-      return 0;
+      return;
     }
 
   /* v{4,6}_port non-zero indicates the address family stopped advertising */
@@ -1534,11 +1537,9 @@ device_remove_family(struct player_command *cmd)
     }
 
   device_free(dev);
-
-  return 0;
 }
 
-/* RAOP callbacks executed in the player thread */
+/* RAOP callbacks executed on the player queue */
 static void
 device_streaming_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
 {
@@ -1565,6 +1566,9 @@ device_streaming_cb(struct raop_device *dev, struct raop_session *rs, enum raop_
 
       if (!dev->advertised)
 	device_remove(dev);
+
+      /* Done with this device */
+      dispatch_group_leave(player_grp);
     }
   else if (status == RAOP_STOPPED)
     {
@@ -1584,6 +1588,9 @@ device_streaming_cb(struct raop_device *dev, struct raop_session *rs, enum raop_
 
       if (!dev->advertised)
 	device_remove(dev);
+
+      /* Done with this device */
+      dispatch_group_leave(player_grp);
     }
 }
 
@@ -1625,7 +1632,7 @@ device_shutdown_cb(struct raop_device *dev, struct raop_session *rs, enum raop_s
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
-      goto out;
+      goto out; /* Need to leave the group */
     }
 
   dev->session = NULL;
@@ -1634,6 +1641,9 @@ device_shutdown_cb(struct raop_device *dev, struct raop_session *rs, enum raop_s
     device_remove(dev);
 
  out:
+  /* Done with this device */
+  dispatch_group_leave(player_grp);
+
   if (cur_cmd->raop_pending == 0)
     {
       /* cur_cmd->ret already set
@@ -1652,6 +1662,9 @@ device_lost_cb(struct raop_device *dev, struct raop_session *rs, enum raop_sessi
     DPRINTF(E_WARN, L_PLAYER, "Failed to stop lost device\n");
   else
     DPRINTF(E_INFO, L_PLAYER, "Lost device stopped properly\n");
+
+  /* Done with this device */
+  dispatch_group_leave(player_grp);
 }
 
 static void
@@ -1667,6 +1680,7 @@ device_activate_cb(struct raop_device *dev, struct raop_session *rs, enum raop_s
     {
       DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during startup!\n");
 
+      /* device_lost_cb() will leave the group */
       raop_set_status_cb(rs, device_lost_cb);
       raop_device_stop(rs);
 
@@ -1687,6 +1701,9 @@ device_activate_cb(struct raop_device *dev, struct raop_session *rs, enum raop_s
 
       if (!dev->advertised)
 	device_remove(dev);
+
+      /* Done with this device */
+      dispatch_group_leave(player_grp);
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
@@ -1744,6 +1761,9 @@ device_probe_cb(struct raop_device *dev, struct raop_session *rs, enum raop_sess
     {
       DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during probe!\n");
 
+      /* Done with this device */
+      dispatch_group_leave(player_grp);
+
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
       goto out;
@@ -1761,6 +1781,9 @@ device_probe_cb(struct raop_device *dev, struct raop_session *rs, enum raop_sess
 
       if (!dev->advertised)
 	device_remove(dev);
+
+      /* Done with this device */
+      dispatch_group_leave(player_grp);
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
@@ -1791,6 +1814,7 @@ device_restart_cb(struct raop_device *dev, struct raop_session *rs, enum raop_se
     {
       DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during restart!\n");
 
+      /* device_lost_cb() will leave the group */
       raop_set_status_cb(rs, device_lost_cb);
       raop_device_stop(rs);
 
@@ -1803,6 +1827,9 @@ device_restart_cb(struct raop_device *dev, struct raop_session *rs, enum raop_se
 
       if (!dev->advertised)
 	device_remove(dev);
+
+      /* Done with this device */
+      dispatch_group_leave(player_grp);
 
       goto out;
     }
@@ -1832,11 +1859,12 @@ playback_abort(void)
   if (raop_sessions > 0)
     raop_playback_stop();
 
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
-
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
+  if (pb_timer_src)
+    {
+      dispatch_source_cancel(pb_timer_src);
+      dispatch_release(pb_timer_src);
+      pb_timer_src = NULL;
+    }
 
   if (cur_playing)
     source_stop(cur_playing);
@@ -1968,11 +1996,12 @@ playback_stop(struct player_command *cmd)
    */
   cmd->raop_pending = raop_flush(device_command_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
 
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
-
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
+  if (pb_timer_src)
+    {
+      dispatch_source_cancel(pb_timer_src);
+      dispatch_release(pb_timer_src);
+      pb_timer_src = NULL;
+    }
 
   if (cur_playing)
     source_stop(cur_playing);
@@ -2035,8 +2064,6 @@ playback_start_bh(struct player_command *cmd)
       goto out_fail;
     }
 
-  memset(&pb_timer_ev, 0, sizeof(struct event));
-
 #if defined(__linux__)
   pb_timer_last.tv_sec = pb_pos_stamp.tv_sec;
   pb_timer_last.tv_nsec = pb_pos_stamp.tv_nsec;
@@ -2083,16 +2110,20 @@ playback_start_bh(struct player_command *cmd)
     }
 #endif
 
-  event_set(&pb_timer_ev, pb_timer_fd, EV_READ, player_playback_cb, NULL);
-  event_base_set(evbase_player, &pb_timer_ev);
-
-  ret = event_add(&pb_timer_ev, NULL);
-  if (ret < 0)
+  pb_timer_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, pb_timer_fd, 0, player_sq);
+  if (!pb_timer_src)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Could not set up playback timer event\n");
+      DPRINTF(E_LOG, L_PLAYER, "Could not create dispatch source for playback timer\n");
 
       goto out_fail;
     }
+
+  /* Group left in the cancel handler */
+  dispatch_group_enter(player_grp);
+
+  dispatch_source_set_event_handler_f(pb_timer_src, player_playback_cb);
+  dispatch_source_set_cancel_handler_f(pb_timer_src, player_playback_cancel_cb);
+  dispatch_resume(pb_timer_src);
 
   /* Everything OK, start RAOP */
   if (raop_sessions > 0)
@@ -2237,6 +2268,9 @@ playback_start(struct player_command *cmd)
 	    }
 
 	  cmd->raop_pending++;
+
+	  /* Group will be left when RAOP is done deactivating the device */
+	  dispatch_group_enter(player_grp);
 	}
     }
 
@@ -2430,11 +2464,12 @@ playback_pause(struct player_command *cmd)
   if (laudio_status != LAUDIO_CLOSED)
     laudio_stop();
 
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
-
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
+  if (pb_timer_src)
+    {
+      dispatch_source_cancel(pb_timer_src);
+      dispatch_release(pb_timer_src);
+      pb_timer_src = NULL;
+    }
 
   if (ps->play_next)
     source_stop(ps->play_next);
@@ -2453,52 +2488,6 @@ playback_pause(struct player_command *cmd)
 
   /* Otherwise, just run the bottom half */
   return cmd->func_bh(cmd);
-}
-
-static int
-speaker_enumerate(struct player_command *cmd)
-{
-  struct raop_device *rd;
-  struct spk_enum *spk_enum;
-  struct spk_flags flags;
-  char *laudio_name;
-
-  spk_enum = cmd->arg.spk_enum;
-
-  laudio_name = cfg_getstr(cfg_getsec(cfg, "audio"), "nickname");
-
-  /* Auto-select local audio if there are no AirTunes devices */
-  if (!dev_list && !laudio_selected)
-    speaker_select_laudio();
-
-  flags.selected = laudio_selected;
-  flags.has_password = 0;
-  flags.has_video = 0;
-
-  spk_enum->cb(0, laudio_name, laudio_relvol, flags, spk_enum->arg);
-
-#ifdef DEBUG_RELVOL
-  DPRINTF(E_DBG, L_PLAYER, "*** master: %d\n", master_volume);
-  DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
-#endif
-
-  for (rd = dev_list; rd; rd = rd->next)
-    {
-      if (rd->advertised || rd->selected)
-	{
-	  flags.selected = rd->selected;
-	  flags.has_password = rd->has_password;
-	  flags.has_video = (rd->devtype == RAOP_DEV_APPLETV);
-
-	  spk_enum->cb(rd->id, rd->name, rd->relvol, flags, spk_enum->arg);
-
-#ifdef DEBUG_RELVOL
-	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
-#endif
-	}
-    }
-
-  return 0;
 }
 
 static int
@@ -2576,6 +2565,9 @@ speaker_activate(struct raop_device *rd)
 	      return -1;
 	    }
 	}
+
+      /* Group will be left when RAOP is done deactivating the device */
+      dispatch_group_enter(player_grp);
 
       return 1;
     }
@@ -3043,59 +3035,63 @@ set_update_handler(struct player_command *cmd)
 }
 
 /* Command processing */
-/* Thread: player */
+/* Queue: player_sq */
 static void
-command_cb(int fd, short what, void *arg)
+command_cb(void *arg)
 {
-  struct player_command *cmd;
   int ret;
 
-  ret = read(cmd_pipe[0], &cmd, sizeof(cmd));
-  if (ret != sizeof(cmd))
+  /* Shutdown in progress */
+  if (cur_cmd)
+    return;
+
+  ret = read(cmd_pipe[0], &cur_cmd, sizeof(cur_cmd));
+  if (ret != sizeof(cur_cmd))
     {
       DPRINTF(E_LOG, L_PLAYER, "Could not read command! (read %d): %s\n", ret, (ret < 0) ? strerror(errno) : "-no error-");
 
-      goto readd;
+      return;
     }
 
-  if (cmd->nonblock)
-    {
-      cmd->func(cmd);
+  pthread_mutex_lock(&cur_cmd->lck);
 
-      free(cmd);
-      goto readd;
-    }
-
-  pthread_mutex_lock(&cmd->lck);
-
-  cur_cmd = cmd;
-
-  ret = cmd->func(cmd);
+  ret = cur_cmd->func(cur_cmd);
 
   if (ret <= 0)
     {
-      cmd->ret = ret;
+      cur_cmd->ret = ret;
+
+      pthread_cond_signal(&cur_cmd->cond);
+      pthread_mutex_unlock(&cur_cmd->lck);
 
       cur_cmd = NULL;
-
-      pthread_cond_signal(&cmd->cond);
-      pthread_mutex_unlock(&cmd->lck);
     }
   else
     {
       /* Command is asynchronous, we don't want to process another command
        * before we're done with this one. See command_async_end().
        */
-
-      return;
+      dispatch_suspend(cmd_src);
     }
+}
 
- readd:
-  event_add(&cmdev, NULL);
+/* Queue: player_sq */
+static void
+command_cancel_cb(void *arg)
+{
+  /* HTTPd & DACP stop before us, so no commands can be left in the queue */
+
+  close(cmd_pipe[0]);
+  close(cmd_pipe[1]);
+
+  cmd_pipe[0] = -1;
+  cmd_pipe[1] = -1;
+
+  dispatch_group_leave(player_grp);
 }
 
 
-/* Thread: httpd (DACP) - mDNS */
+/* Queue: HTTP read queue (DACP) */
 static int
 send_command(struct player_command *cmd)
 {
@@ -3119,20 +3115,7 @@ send_command(struct player_command *cmd)
   return 0;
 }
 
-/* Thread: mDNS */
-static int
-nonblock_command(struct player_command *cmd)
-{
-  int ret;
-
-  ret = send_command(cmd);
-  if (ret < 0)
-    return -1;
-
-  return 0;
-}
-
-/* Thread: httpd (DACP) */
+/* Queue: HTTP read queue (DACP) */
 static int
 sync_command(struct player_command *cmd)
 {
@@ -3313,21 +3296,45 @@ player_playback_prev(void)
 void
 player_speaker_enumerate(spk_enum_cb cb, void *arg)
 {
-  struct player_command cmd;
-  struct spk_enum spk_enum;
+  char *laudio_name;
 
-  command_init(&cmd);
+  laudio_name = cfg_getstr(cfg_getsec(cfg, "audio"), "nickname");
 
-  spk_enum.cb = cb;
-  spk_enum.arg = arg;
+  dispatch_sync(player_sq, ^{
+      struct spk_flags flags;
+      struct raop_device *rd;
 
-  cmd.func = speaker_enumerate;
-  cmd.func_bh = NULL;
-  cmd.arg.spk_enum = &spk_enum;
+      /* Auto-select local audio if there are no AirTunes devices */
+      if (!dev_list && !laudio_selected)
+	speaker_select_laudio();
 
-  sync_command(&cmd);
+      flags.selected = laudio_selected;
+      flags.has_password = 0;
+      flags.has_video = 0;
 
-  command_deinit(&cmd);
+      cb(0, laudio_name, laudio_relvol, flags, arg);
+
+#ifdef DEBUG_RELVOL
+      DPRINTF(E_DBG, L_PLAYER, "*** master: %d\n", master_volume);
+      DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
+#endif
+
+      for (rd = dev_list; rd; rd = rd->next)
+	{
+	  if (rd->advertised || rd->selected)
+	    {
+	      flags.selected = rd->selected;
+	      flags.has_password = rd->has_password;
+	      flags.has_video = (rd->devtype == RAOP_DEV_APPLETV);
+
+	      cb(rd->id, rd->name, rd->relvol, flags, arg);
+
+#ifdef DEBUG_RELVOL
+	      DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
+#endif
+	    }
+	}
+    });
 }
 
 int
@@ -3513,74 +3520,9 @@ player_set_update_handler(player_status_handler handler)
   command_deinit(&cmd);
 }
 
-/* Non-blocking commands used by mDNS */
-static void
-player_device_add(struct raop_device *rd)
-{
-  struct player_command *cmd;
-  int ret;
-
-  cmd = (struct player_command *)malloc(sizeof(struct player_command));
-  if (!cmd)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not allocate player_command\n");
-
-      device_free(rd);
-      return;
-    }
-
-  memset(cmd, 0, sizeof(struct player_command));
-
-  cmd->nonblock = 1;
-
-  cmd->func = device_add;
-  cmd->arg.rd = rd;
-
-  ret = nonblock_command(cmd);
-  if (ret < 0)
-    {
-      free(cmd);
-      device_free(rd);
-
-      return;
-    }
-}
-
-static void
-player_device_remove(struct raop_device *rd)
-{
-  struct player_command *cmd;
-  int ret;
-
-  cmd = (struct player_command *)malloc(sizeof(struct player_command));
-  if (!cmd)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not allocate player_command\n");
-
-      device_free(rd);
-      return;
-    }
-
-  memset(cmd, 0, sizeof(struct player_command));
-
-  cmd->nonblock = 1;
-
-  cmd->func = device_remove_family;
-  cmd->arg.rd = rd;
-
-  ret = nonblock_command(cmd);
-  if (ret < 0)
-    {
-      free(cmd);
-      device_free(rd);
-
-      return;
-    }
-}
-
 
 /* RAOP devices discovery - mDNS callback */
-/* Thread: main (mdns) */
+/* Queue: mdns_sq */
 static void
 raop_device_cb(const char *name, const char *type, const char *domain, const char *hostname, int family, const char *address, int port, struct keyval *txt)
 {
@@ -3640,8 +3582,7 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
 	    break;
 	}
 
-      player_device_remove(rd);
-
+      dispatch_async_f(player_sq, rd, device_remove_family);
       return;
     }
 
@@ -3743,60 +3684,35 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
   rd->has_password = has_password;
   rd->password = password;
 
-  player_device_add(rd);
-
+  dispatch_async_f(player_sq, rd, device_add);
   return;
 
  free_rd:
   device_free(rd);
 }
 
-/* Thread: player */
-static void *
-player(void *arg)
+
+/* Queue: player_sq */
+static void
+player_init_task(void *arg)
 {
-  struct raop_device *rd;
   int ret;
 
-  ret = db_perthread_init();
+  ret = db_pool_get();
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Error: DB init failed\n");
+      DPRINTF(E_LOG, L_PLAYER, "Could not acquire database connection; cannot reload saved settings\n");
 
-      pthread_exit(NULL);
+      return;
     }
 
-  event_base_dispatch(evbase_player);
-
-  if (!player_exit)
-    DPRINTF(E_LOG, L_PLAYER, "Player event loop terminated ahead of time!\n");
-
-  /* Save selected devices */
-  db_speaker_clear_all();
-
-  ret = db_speaker_save(0, laudio_selected, laudio_volume);
+  ret = db_speaker_get(0, &laudio_selected, &laudio_volume);
   if (ret < 0)
-    DPRINTF(E_LOG, L_PLAYER, "Could not save state for local audio\n");
+    laudio_volume = 75;
+  else if (laudio_selected)
+    speaker_select_laudio(); /* Run the select helper */
 
-  for (rd = dev_list; rd; rd = rd->next)
-    {
-      ret = db_speaker_save(rd->id, rd->selected, rd->volume);
-      if (ret < 0)
-	DPRINTF(E_LOG, L_PLAYER, "Could not save state for speaker %s\n", rd->name);
-    }
-
-  db_perthread_deinit();
-
-  pthread_exit(NULL);
-}
-
-/* Thread: player */
-static void
-exit_cb(int fd, short what, void *arg)
-{
-  event_base_loopbreak(evbase_player);
-
-  player_exit = 1;
+  db_pool_release();
 }
 
 /* Thread: main */
@@ -3808,20 +3724,18 @@ player_init(void)
   int mdns_flags;
   int ret;
 
-  player_exit = 0;
-
   dev_autoselect = 1;
   dev_list = NULL;
 
   master_volume = -1;
 
-  laudio_selected = 0;
   laudio_status = LAUDIO_CLOSED;
   raop_sessions = 0;
 
   cur_cmd = NULL;
 
   pb_timer_fd = -1;
+  pb_timer_src = NULL;
 
   source_head = NULL;
   shuffle_head = NULL;
@@ -3835,50 +3749,40 @@ player_init(void)
 
   update_handler = NULL;
 
+  /* Initial state, init task will reload from DB */
+  laudio_selected = 0;
+
   /* Random RTP time start */
   gcry_randomize(&rnd, sizeof(rnd), GCRY_STRONG_RANDOM);
   last_rtptime = ((uint64_t)1 << 32) | rnd;
 
   rng_init(&shuffle_rng);
 
-  ret = db_speaker_get(0, &laudio_selected, &laudio_volume);
-  if (ret < 0)
-    laudio_volume = 75;
-  else if (laudio_selected)
-    speaker_select_laudio(); /* Run the select helper */
-
-  audio_buf = evbuffer_new();
-  if (!audio_buf)
+  player_sq = dispatch_queue_create("org.forked-daapd.player", NULL);
+  if (!player_sq)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Could not allocate evbuffer for audio buffer\n");
+      DPRINTF(E_FATAL, L_PLAYER, "Could not create player dispatch queue\n");
 
       return -1;
     }
 
   raop_v6enabled = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6");
 
-
-#ifdef USE_EVENTFD
-  exit_efd = eventfd(0, EFD_CLOEXEC);
-  if (exit_efd < 0)
+  player_grp = dispatch_group_create();
+  if (!player_grp)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Could not create eventfd: %s\n", strerror(errno));
+      DPRINTF(E_FATAL, L_PLAYER, "Could not create player dispatch group\n");
 
-      goto exit_fail;
+      goto player_grp_fail;
     }
-#else
-# if defined(__linux__)
-  ret = pipe2(exit_pipe, O_CLOEXEC);
-# else
-  ret = pipe(exit_pipe);
-# endif
-  if (ret < 0)
+
+  audio_buf = evbuffer_new();
+  if (!audio_buf)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Could not create pipe: %s\n", strerror(errno));
+      DPRINTF(E_LOG, L_PLAYER, "Could not allocate evbuffer for audio buffer\n");
 
-      goto exit_fail;
+      goto audio_buf_fail;
     }
-#endif /* USE_EVENTFD */
 
 # if defined(__linux__)
   ret = pipe2(cmd_pipe, O_CLOEXEC);
@@ -3891,26 +3795,6 @@ player_init(void)
 
       goto cmd_fail;
     }
-
-  evbase_player = event_base_new();
-  if (!evbase_player)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not create an event base\n");
-
-      goto evbase_fail;
-    }
-
-#ifdef USE_EVENTFD
-  event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
-#else
-  event_set(&exitev, exit_pipe[0], EV_READ, exit_cb, NULL);
-#endif
-  event_base_set(evbase_player, &exitev);
-  event_add(&exitev, NULL);
-
-  event_set(&cmdev, cmd_pipe[0], EV_READ, command_cb, NULL);
-  event_base_set(evbase_player, &cmdev);
-  event_add(&cmdev, NULL);
 
   ret = laudio_init(player_laudio_status_cb);
   if (ret < 0)
@@ -3928,6 +3812,21 @@ player_init(void)
       goto raop_fail;
     }
 
+  cmd_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, cmd_pipe[0], 0, player_sq);
+  if (!cmd_src)
+    {
+      DPRINTF(E_FATAL, L_PLAYER, "Could not create dispatch source for player commands\n");
+
+      goto cmd_src_fail;
+    }
+
+  /* Group left in the cancel handler */
+  dispatch_group_enter(player_grp);
+
+  dispatch_source_set_event_handler_f(cmd_src, command_cb);
+  dispatch_source_set_cancel_handler_f(cmd_src, command_cancel_cb);
+  dispatch_resume(cmd_src);
+
   if (raop_v6enabled)
     mdns_flags = MDNS_WANT_V4 | MDNS_WANT_V6 | MDNS_WANT_V6LL;
   else
@@ -3941,37 +3840,86 @@ player_init(void)
       goto mdns_browse_fail;
     }
 
-  ret = pthread_create(&tid_player, NULL, player, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
-
-      goto thread_fail;
-    }
+  dispatch_async_f(player_sq, NULL, player_init_task);
 
   return 0;
 
- thread_fail:
  mdns_browse_fail:
+  dispatch_source_cancel(cmd_src);
+  dispatch_release(cmd_src);
+ cmd_src_fail:
   raop_deinit();
  raop_fail:
   laudio_deinit();
  laudio_fail:
-  event_base_free(evbase_player);
- evbase_fail:
   close(cmd_pipe[0]);
   close(cmd_pipe[1]);
  cmd_fail:
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-#endif
- exit_fail:
   evbuffer_free(audio_buf);
+ audio_buf_fail:
+  dispatch_release(player_grp);
+ player_grp_fail:
+  dispatch_release(player_sq);
 
   return -1;
+}
+
+/* Queue: player_sq */
+static void
+player_deinit_task1(void *arg)
+{
+  struct raop_device *rd;
+  int ret;
+
+  ret = db_pool_get();
+  if (ret < 0)
+    DPRINTF(E_WARN, L_PLAYER, "Could not acquire database connection; cannot save selected speakers\n");
+  else
+    {
+      /* Save selected devices */
+      db_speaker_clear_all();
+
+      ret = db_speaker_save(0, laudio_selected, laudio_volume);
+      if (ret < 0)
+	DPRINTF(E_LOG, L_PLAYER, "Could not save state for local audio\n");
+
+      for (rd = dev_list; rd; rd = rd->next)
+	{
+	  ret = db_speaker_save(rd->id, rd->selected, rd->volume);
+	  if (ret < 0)
+	    DPRINTF(E_LOG, L_PLAYER, "Could not save state for speaker %s\n", rd->name);
+	}
+
+      db_pool_release();
+    }
+
+  if (player_state != PLAY_STOPPED)
+    playback_abort();
+
+  if (cur_cmd)
+    DPRINTF(E_LOG, L_PLAYER, "BUG: async command in progress during player shutdown!\n");
+
+  dispatch_source_cancel(cmd_src);
+  dispatch_release(cmd_src);
+}
+
+/* Queue: player_sq */
+static void
+player_deinit_task2(void *arg)
+{
+  struct raop_device *rd;
+
+  if (source_head)
+    queue_clear(NULL);
+
+  for (rd = dev_list; dev_list; rd = dev_list)
+    {
+      dev_list = rd->next;
+
+      device_free(rd);
+    }
+
+  evbuffer_free(audio_buf);
 }
 
 /* Thread: main */
@@ -3980,56 +3928,20 @@ player_deinit(void)
 {
   int ret;
 
-#ifdef USE_EVENTFD
-  ret = eventfd_write(exit_efd, 1);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not send exit event: %s\n", strerror(errno));
+  /* Stop player properly */
+  dispatch_sync_f(player_sq, NULL, player_deinit_task1);
 
-      return;
-    }
-#else
-  int dummy = 42;
+  ret = dispatch_group_wait(player_grp, DISPATCH_TIME_FOREVER);
+  dispatch_release(player_grp);
 
-  ret = write(exit_pipe[1], &dummy, sizeof(dummy));
-  if (ret != sizeof(dummy))
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not write to exit fd: %s\n", strerror(errno));
-
-      return;
-    }
-#endif
-
-  ret = pthread_join(tid_player, NULL);
   if (ret != 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not join HTTPd thread: %s\n", strerror(errno));
+    DPRINTF(E_LOG, L_PLAYER, "Error waiting for dispatch group\n");
 
-      return;
-    }
+  /* Cleanup */
+  dispatch_sync_f(player_sq, NULL, player_deinit_task2);
 
-  if (source_head)
-    queue_clear(NULL);
-
-  evbuffer_free(audio_buf);
+  dispatch_release(player_sq);
 
   laudio_deinit();
   raop_deinit();
-
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
-
-  event_del(&cmdev);
-
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-#endif
-  close(cmd_pipe[0]);
-  close(cmd_pipe[1]);
-  cmd_pipe[0] = -1;
-  cmd_pipe[1] = -1;
-  event_base_free(evbase_player);
 }
