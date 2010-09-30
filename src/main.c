@@ -603,16 +603,6 @@ main(int argc, char **argv)
       goto startup_fail;
     }
 
-  /* Open a DB connection for the main thread */
-  ret = db_perthread_init();
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_MAIN, "Could not perform perthread DB init for main\n");
-
-      shutdown_plan = SHUTDOWN_FAIL_DB;
-      goto startup_fail;
-    }
-
   /* Spawn file scanner thread */
   ret = filescanner_init();
   if (ret != 0)
@@ -745,8 +735,6 @@ main(int argc, char **argv)
     });
 
   dispatch_resume(chld_src);
-
-  db_perthread_deinit();
 
   dispatch_main();
 
