@@ -15,8 +15,7 @@
 #define L_RSP     7
 #define L_SCAN    8
 #define L_XCODE   9
-/* libevent logging */
-#define L_EVENT   10
+/* 10 - free */
 #define L_REMOTE  11
 #define L_DACP    12
 #define L_FFMPEG  13
@@ -44,9 +43,6 @@ DPRINTF(int severity, int domain, const char *fmt, ...) __attribute__((format(pr
 
 void
 logger_ffmpeg(void *ptr, int level, const char *fmt, va_list ap);
-
-void
-logger_libevent(int severity, const char *msg);
 
 #ifdef LAUDIO_USE_ALSA
 void

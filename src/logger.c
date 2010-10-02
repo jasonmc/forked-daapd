@@ -29,7 +29,6 @@
 #include <sys/stat.h>
 
 #include <dispatch/dispatch.h>
-#include <event.h>
 
 #include <libavutil/log.h>
 
@@ -44,7 +43,7 @@ static int threshold;
 static int console;
 static char *logfilename;
 static FILE *logfile;
-static char *labels[] = { "config", "daap", "db", "httpd", "main", "mdns", "misc", "rsp", "scan", "xcode", "event", "remote", "dacp", "ffmpeg", "artwork", "player", "raop", "laudio", "dmap", "dbperf", "http" };
+static char *labels[] = { "config", "daap", "db", "httpd", "main", "mdns", "misc", "rsp", "scan", "xcode", "-free-", "remote", "dacp", "ffmpeg", "artwork", "player", "raop", "laudio", "dmap", "dbperf", "http" };
 
 
 static int
@@ -221,35 +220,6 @@ logger_ffmpeg(void *ptr, int level, const char *fmt, va_list ap)
     severity = E_LOG;
 
   vlogger(severity, L_FFMPEG, fmt, ap);
-}
-
-void
-logger_libevent(int severity, const char *msg)
-{
-  switch (severity)
-    {
-      case _EVENT_LOG_DEBUG:
-	severity = E_DBG;
-	break;
-
-      case _EVENT_LOG_ERR:
-	severity = E_LOG;
-	break;
-
-      case _EVENT_LOG_WARN:
-	severity = E_WARN;
-	break;
-
-      case _EVENT_LOG_MSG:
-	severity = E_INFO;
-	break;
-
-      default:
-	severity = E_LOG;
-	break;
-    }
-
-  DPRINTF(severity, L_EVENT, "%s\n", msg);
 }
 
 #ifdef LAUDIO_USE_ALSA
