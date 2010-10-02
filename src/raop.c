@@ -57,11 +57,11 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
-#include <event.h>
 #include <dispatch/dispatch.h>
 
 #include <gcrypt.h>
 
+#include "evbuffer/evbuffer.h"
 #include "conffile.h"
 #include "logger.h"
 #include "misc.h"

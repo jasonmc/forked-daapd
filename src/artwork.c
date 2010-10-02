@@ -29,12 +29,11 @@
 #include <fcntl.h>
 #include <limits.h>
 
-#include <event.h>
-
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 
+#include "evbuffer/evbuffer.h"
 #include "db.h"
 #include "logger.h"
 #if LIBAVFORMAT_VERSION_MAJOR >= 53

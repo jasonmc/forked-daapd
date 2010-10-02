@@ -33,9 +33,9 @@
 
 #include <errno.h>
 
-#include <event.h>
 #include <dispatch/dispatch.h>
 
+#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "network.h"
 

@@ -2,7 +2,7 @@
 #ifndef __DMAP_HELPERS_H__
 #define __DMAP_HELPERS_H__
 
-#include <event.h>
+#include "evbuffer/evbuffer.h"
 
 #include "db.h"
 #include "httpd.h"

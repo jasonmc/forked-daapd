@@ -3,8 +3,8 @@
 #define __HTTP_H__
 
 #include <dispatch/dispatch.h>
-#include <event.h>
 
+#include "evbuffer/evbuffer.h"
 #include "misc.h"
 
 

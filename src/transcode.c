@@ -38,11 +38,10 @@
 # include <sys/endian.h>
 #endif
 
-#include <event.h>
-
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 
+#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "conffile.h"
 #include "db.h"

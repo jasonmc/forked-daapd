@@ -7,9 +7,9 @@
 #include <netinet/in.h>
 #include <net/if.h>
 
-#include <event.h>
 #include <dispatch/dispatch.h>
 
+#include "evbuffer/evbuffer.h"
 
 union sockaddr_all {
   struct sockaddr_storage ss;

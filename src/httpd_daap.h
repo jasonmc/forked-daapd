@@ -2,8 +2,6 @@
 #ifndef __HTTPD_DAAP_H__
 #define __HTTPD_DAAP_H__
 
-#include <event.h>
-
 #include "http.h"
 
 int

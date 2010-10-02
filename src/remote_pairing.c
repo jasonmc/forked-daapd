@@ -41,10 +41,10 @@
 #include <errno.h>
 
 #include <dispatch/dispatch.h>
-#include <event.h>
 
 #include <gcrypt.h>
 
+#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "conffile.h"
 #include "mdns.h"

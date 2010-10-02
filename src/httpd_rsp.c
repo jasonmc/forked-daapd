@@ -31,11 +31,11 @@
 #include <limits.h>
 
 #include <dispatch/dispatch.h>
-#include <event.h>
 
 #include <tre/tre.h>
 #include <mxml.h>
 
+#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "db.h"
 #include "conffile.h"

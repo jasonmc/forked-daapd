@@ -32,10 +32,10 @@
 #include <inttypes.h>
 
 #include <dispatch/dispatch.h>
-#include <event.h>
 
 #include <tre/tre.h>
 
+#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "misc.h"
 #include "conffile.h"

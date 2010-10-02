@@ -23,8 +23,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include <event.h>
-
+#include "evbuffer/evbuffer.h"
 #include "db.h"
 #include "misc.h"
 #include "logger.h"

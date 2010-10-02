@@ -28,9 +28,9 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#include <event.h>
 #include <dispatch/dispatch.h>
 
+#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "misc.h"
 #include "network.h"

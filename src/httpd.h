@@ -2,7 +2,7 @@
 #ifndef __HTTPD_H__
 #define __HTTPD_H__
 
-#include <event.h>
+#include "evbuffer/evbuffer.h"
 #include "http.h"
 
 

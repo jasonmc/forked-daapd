@@ -39,10 +39,10 @@
 #endif
 
 #include <dispatch/dispatch.h>
-#include <event.h>
 
 #include <gcrypt.h>
 
+#include "evbuffer/evbuffer.h"
 #include "db.h"
 #include "daap_query.h"
 #include "logger.h"
