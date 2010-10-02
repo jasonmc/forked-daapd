@@ -369,6 +369,9 @@ ffmpeg_lockmgr(void **mutex, enum AVLockOp op)
 
 
 static void
+app_startup(int logsync, int mdns_no_rsp, int mdns_no_daap, char *ffid);
+
+static void
 app_shutdown(shutdown_plan_t plan);
 
 int
@@ -415,7 +418,6 @@ main(int argc, char **argv)
   ffid = NULL;
   mdns_no_rsp = 0;
   mdns_no_daap = 0;
-  shutdown_plan = SHUTDOWN_PLAN_NOMINAL;
 
   int_src = NULL;
   term_src = NULL;
@@ -563,6 +565,42 @@ main(int argc, char **argv)
       goto startup_fail;
     }
 
+  main_q = dispatch_get_main_queue();
+  if (!main_q)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Could not get main dispatch queue\n");
+
+      shutdown_plan = SHUTDOWN_FAIL_DAEMON;
+      goto startup_fail;
+    }
+
+  dispatch_async(main_q, ^{
+      app_startup(logsync, mdns_no_rsp, mdns_no_daap, ffid);
+    });
+
+  dispatch_main();
+
+  /* NOT REACHED */
+
+ startup_fail:
+  app_shutdown(shutdown_plan);
+
+  /* NOT REACHED */
+
+  exit(EXIT_FAILURE);
+
+  return 0;
+}
+
+static void
+app_startup(int logsync, int mdns_no_rsp, int mdns_no_daap, char *ffid)
+{
+  dispatch_queue_t main_q;
+  shutdown_plan_t shutdown_plan;
+  int ret;
+
+  main_q = dispatch_get_current_queue();
+
   /* Switch logger into dispatch mode (after forking) */
   ret = logger_start_dispatch(logsync);
   if (ret < 0)
@@ -645,15 +683,6 @@ main(int argc, char **argv)
     }
 
   /* Set up signal dispatch sources */
-  main_q = dispatch_get_main_queue();
-  if (!main_q)
-    {
-      DPRINTF(E_FATAL, L_MAIN, "Could not get main dispatch queue\n");
-
-      shutdown_plan = SHUTDOWN_FAIL_SIGNAL;
-      goto startup_fail;
-    }
-
   signal(SIGINT, SIG_IGN);
 
   int_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGINT, 0, main_q);
@@ -729,7 +758,7 @@ main(int argc, char **argv)
 
   dispatch_resume(chld_src);
 
-  dispatch_main();
+  return;
 
  startup_fail:
   app_shutdown(shutdown_plan);
@@ -737,8 +766,6 @@ main(int argc, char **argv)
   /* NOT REACHED */
 
   exit(EXIT_FAILURE);
-
-  return 0;
 }
 
 static void
