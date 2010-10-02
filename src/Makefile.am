@@ -93,8 +93,6 @@ forked_daapd_SOURCES = main.c \
 	player.c player.h \
 	$(ALSASRC) $(OSS4SRC) laudio.h \
 	raop.c raop.h \
-	evrtsp/rtsp.c evrtp/evrtsp.h \
-	evrtsp/rtsp-internal.h evrtsp/log.h \
 	scan-wma.c \
 	$(FLACSRC) $(MUSEPACKSRC)
 
