@@ -42,7 +42,6 @@
 #include <dispatch/dispatch.h>
 
 #include <getopt.h>
-#include <event.h>
 #include <libavutil/log.h>
 #include <libavformat/avformat.h>
 
@@ -513,9 +512,6 @@ main(int argc, char **argv)
       return EXIT_FAILURE;
     }
 
-  /* Set up libevent logging callback */
-  event_set_log_callback(logger_libevent);
-
   DPRINTF(E_LOG, L_MAIN, "Forked Media Server Version %s taking off\n", VERSION);
 
   /* Initialize ffmpeg */
@@ -578,9 +574,6 @@ main(int argc, char **argv)
     }
 
   DPRINTF(E_DBG, L_MAIN, "Logger switched to dispatch mode\n");
-
-  /* Initialize libevent (after forking) */
-  event_init();
 
   DPRINTF(E_LOG, L_MAIN, "mDNS init\n");
   ret = mdns_init();
