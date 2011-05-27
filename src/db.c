@@ -4141,7 +4141,7 @@ db_pool_deinit(void)
 
 /* Per-thread database handles */
 
-int
+static int
 db_perthread_init(void)
 {
   pool_hdl = (struct db_pool_hdl *)malloc(sizeof(struct db_pool_hdl));
@@ -4162,7 +4162,7 @@ db_perthread_init(void)
   return 0;
 }
 
-void
+static void
 db_perthread_deinit(void)
 {
   if (!pool_hdl)

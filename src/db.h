@@ -483,12 +483,6 @@ db_pool_release(void);
 
 
 int
-db_perthread_init(void);
-
-void
-db_perthread_deinit(void);
-
-int
 db_init(void);
 
 void
