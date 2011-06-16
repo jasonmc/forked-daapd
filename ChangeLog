@@ -1,17 +1,26 @@
 ChangeLog for forked-daapd
 --------------------------
 
+version 0.19gcd:
+	- no GCD-specific changes.
+
 version 0.19:
 	- more libav 0.7 updates.
 	- database speedups.
 	- fix for iTunes 30-minute timeout.
 	- fixes, big and small.
 
+version 0.18gcd:
+	- build fix for FreeBSD, from Raivo Hool.
+
 version 0.18:
 	- add config knob for ALSA mixer channel name.
 	- do not elevate privileges for reopening the log file; log file
 	  will now be owned by the user forked-daapd runs as.
 	- fixes, big and small.
+
+version 0.17gcd:
+	- initial release of the GCD codebase.
 
 version 0.17:
 	- support for libav 0.7
