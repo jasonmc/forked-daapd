@@ -42,6 +42,8 @@
 #include <tre/tre.h>
 #include <avl.h>
 
+#include <gcrypt.h>
+
 #include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "db.h"
@@ -102,7 +104,6 @@ static char *default_meta_group = "dmap.itemname,dmap.persistentid,daap.songalbu
 /* DAAP session tracking */
 static dispatch_queue_t sessions_sq;
 static avl_tree_t *daap_sessions;
-static int next_session_id;
 
 /* Update requests */
 static int current_rev;
@@ -199,11 +200,18 @@ daap_session_register(void)
 
   dispatch_sync(sessions_sq, ^{
       avl_node_t *node;
+      struct daap_session existing;
 
-      s->id = next_session_id;
+      /* Find a random session id that is not in use. */
+      do
+        {
+	  gcry_create_nonce((unsigned char *)&existing.id, sizeof(existing.id));
+	  if (existing.id < 0)
+            existing.id += INT_MAX + 1; /* Convert negative two's complement to positive. */
+        }
+      while (avl_search(daap_sessions, &existing) != NULL);
 
-      next_session_id++;
-
+      s->id = existing.id;
       node = avl_insert(daap_sessions, s);
       if (!node)
 	{
@@ -2744,7 +2752,6 @@ daap_init(void)
   int i;
   int ret;
 
-  next_session_id = 100; /* gotta start somewhere, right? */
   current_rev = 2;
   update_requests = NULL;
 
